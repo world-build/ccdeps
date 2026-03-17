@@ -207,12 +207,65 @@ fn conformance_conditional_include() {
         "#define USE_YES 1\n#if USE_YES\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\nint main() {}\n",
     );
 
-    // Note: cppscan doesn't evaluate #if conditions yet, so this tests
-    // that we at least find all potentially-included files
-    let cppscan_deps = get_cppscan_deps(&source, &[tc.path().to_path_buf()]);
-    // We should find both yes.h and no.h (conservative scan)
-    // gcc/clang would only find yes.h (they evaluate conditions)
-    assert!(!cppscan_deps.is_empty());
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_ifdef_conditional() {
+    let tc = TestCase::new();
+    tc.write_file("yes.h", "int yes;\n");
+    tc.write_file("no.h", "int no;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define FEATURE\n#ifdef FEATURE\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\nint main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_elif_chain() {
+    let tc = TestCase::new();
+    tc.write_file("a.h", "int a;\n");
+    tc.write_file("b.h", "int b;\n");
+    tc.write_file("c.h", "int c;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define MODE 2\n#if MODE == 1\n#include \"a.h\"\n#elif MODE == 2\n#include \"b.h\"\n#else\n#include \"c.h\"\n#endif\nint main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_nested_conditional() {
+    let tc = TestCase::new();
+    tc.write_file("inner.h", "int inner;\n");
+    tc.write_file("skip.h", "int skip;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define OUTER 1\n#define INNER 1\n#if OUTER\n#if INNER\n#include \"inner.h\"\n#endif\n#else\n#include \"skip.h\"\n#endif\nint main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_define_in_header() {
+    let tc = TestCase::new();
+    tc.write_file("config.h", "#define HAS_FEATURE 1\n");
+    tc.write_file("feature.h", "int feature;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#include \"config.h\"\n#if HAS_FEATURE\n#include \"feature.h\"\n#endif\nint main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
 }
 
 #[test]

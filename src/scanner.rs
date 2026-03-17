@@ -16,6 +16,8 @@ pub struct ScanOptions {
     pub search_paths: SearchPaths,
     /// Custom target name format (None = derive from source filename).
     pub target: Option<String>,
+    /// Command-line macro definitions (`-D`). Each entry is `(name, optional_value)`.
+    pub defines: Vec<(String, Option<String>)>,
 }
 
 impl Default for ScanOptions {
@@ -23,6 +25,7 @@ impl Default for ScanOptions {
         Self {
             search_paths: SearchPaths::default(),
             target: None,
+            defines: Vec::new(),
         }
     }
 }
@@ -55,7 +58,12 @@ impl Scanner {
 
     /// Scan a single translation unit for dependencies.
     pub fn scan_file(&self, source: &Path) -> Result<ScanResult, std::io::Error> {
-        let deps = depgraph::collect_deps(source, &self.options.search_paths, &self.cache)?;
+        let deps = depgraph::collect_deps(
+            source,
+            &self.options.search_paths,
+            &self.cache,
+            &self.options.defines,
+        )?;
         let makefile_output = output::format_makefile_deps(
             source,
             &deps,

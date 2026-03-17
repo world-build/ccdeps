@@ -38,6 +38,8 @@
 
 pub mod minimize;
 pub mod directive;
+pub mod eval;
+pub mod macros;
 pub mod resolve;
 pub mod depgraph;
 pub mod output;

@@ -25,6 +25,14 @@ struct Args {
     #[arg(long = "isystem", value_name = "DIR")]
     system_paths: Vec<PathBuf>,
 
+    /// Define a macro (-D NAME or -D NAME=VALUE).
+    #[arg(short = 'D', value_name = "MACRO")]
+    defines: Vec<String>,
+
+    /// Undefine a macro (-U NAME).
+    #[arg(short = 'U', value_name = "MACRO")]
+    undefines: Vec<String>,
+
     /// Override the target name in output.
     #[arg(short = 'o', long = "target", value_name = "TARGET")]
     target: Option<String>,
@@ -51,6 +59,26 @@ fn main() -> Result<()> {
             .ok();
     }
 
+    // Parse -D flags into (name, optional_value) pairs
+    let mut defines: Vec<(String, Option<String>)> = args
+        .defines
+        .iter()
+        .map(|d| {
+            if let Some((name, value)) = d.split_once('=') {
+                (name.to_string(), Some(value.to_string()))
+            } else {
+                (d.clone(), None)
+            }
+        })
+        .collect();
+
+    // -U flags: define then immediately undefine isn't quite right;
+    // we represent them as defines that will be undef'd. For now,
+    // just remove any -D that conflicts with -U.
+    for u in &args.undefines {
+        defines.retain(|(name, _)| name != u);
+    }
+
     let options = ScanOptions {
         search_paths: cppscan::resolve::SearchPaths {
             quote_paths: args.iquote_paths,
@@ -58,6 +86,7 @@ fn main() -> Result<()> {
             system_paths: args.system_paths,
         },
         target: args.target,
+        defines,
     };
 
     let scanner = Scanner::new(options);
