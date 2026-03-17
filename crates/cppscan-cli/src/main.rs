@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use cppscan::{ScanOptions, Scanner};
+use cppscan::{DepMode, OutputOptions, ScanOptions, Scanner};
 use std::path::PathBuf;
 
 /// High-performance C preprocessor dependency scanner.
@@ -40,6 +40,44 @@ struct Args {
     /// Number of threads (0 = auto-detect).
     #[arg(short = 'j', long = "jobs", default_value = "0")]
     jobs: usize,
+
+    // ---- -M family flags ----
+
+    /// Print dependencies to stdout (default mode).
+    #[arg(short = 'M', long, conflicts_with_all = ["mm", "md", "mmd"])]
+    m: bool,
+
+    /// Like -M but omit system headers.
+    #[arg(long = "MM", conflicts_with_all = ["m", "md", "mmd"])]
+    mm: bool,
+
+    /// Write dependencies to a .d file.
+    #[arg(long = "MD", conflicts_with_all = ["m", "mm", "mmd"])]
+    md: bool,
+
+    /// Like -MD but omit system headers.
+    #[arg(long = "MMD", conflicts_with_all = ["m", "mm", "md"])]
+    mmd: bool,
+
+    /// Override the dependency output filename (used with -MD/-MMD).
+    #[arg(long = "MF", value_name = "FILE")]
+    mf: Option<PathBuf>,
+
+    /// Override the Make target name (can be specified multiple times).
+    #[arg(long = "MT", value_name = "TARGET")]
+    mt: Vec<String>,
+
+    /// Override the Make target name with quoting (can be specified multiple times).
+    #[arg(long = "MQ", value_name = "TARGET")]
+    mq: Vec<String>,
+
+    /// Add phony targets for each dependency.
+    #[arg(long = "MP")]
+    mp: bool,
+
+    /// Treat missing headers as generated (add to deps instead of erroring).
+    #[arg(long = "MG")]
+    mg: bool,
 }
 
 fn main() -> Result<()> {
@@ -72,12 +110,29 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    // -U flags: define then immediately undefine isn't quite right;
-    // we represent them as defines that will be undef'd. For now,
-    // just remove any -D that conflicts with -U.
+    // -U flags: remove any -D that conflicts with -U.
     for u in &args.undefines {
         defines.retain(|(name, _)| name != u);
     }
+
+    // Determine dep mode
+    let dep_mode = if args.mmd {
+        DepMode::MMD
+    } else if args.md {
+        DepMode::MD
+    } else if args.mm {
+        DepMode::MM
+    } else {
+        DepMode::M
+    };
+
+    // Build output options from -MT/-MQ/-MP, falling back to legacy -o target
+    let output_options = OutputOptions {
+        targets: args.mt,
+        quoted_targets: args.mq,
+        phony: args.mp,
+        ..Default::default()
+    };
 
     let options = ScanOptions {
         search_paths: cppscan::resolve::SearchPaths {
@@ -87,6 +142,9 @@ fn main() -> Result<()> {
         },
         target: args.target,
         defines,
+        dep_mode,
+        dep_file: args.mf,
+        output_options,
     };
 
     let scanner = Scanner::new(options);
@@ -94,7 +152,15 @@ fn main() -> Result<()> {
 
     for result in results {
         match result {
-            Ok(scan) => print!("{}", scan.makefile_output),
+            Ok(scan) => {
+                if let Some(ref dep_file) = scan.dep_file_path {
+                    // -MD/-MMD: write to file
+                    std::fs::write(dep_file, &scan.makefile_output)?;
+                } else {
+                    // -M/-MM: print to stdout
+                    print!("{}", scan.makefile_output);
+                }
+            }
             Err(e) => eprintln!("cppscan: error: {}", e),
         }
     }

@@ -399,6 +399,244 @@ fn conformance_chained_macro_include() {
     assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
 }
 
+// ---- Phase 3: -M flag variants & output compatibility ----
+
+#[test]
+fn conformance_mm_omits_system_headers() {
+    let tc = TestCase::new();
+    let sys_dir = tempfile::tempdir().unwrap();
+
+    tc.write_file("user.h", "int user;\n");
+    fs::write(sys_dir.path().join("sys.h"), "int sys;\n").unwrap();
+    let source = tc.write_file(
+        "main.c",
+        "#include \"user.h\"\n#include <sys.h>\nint main() {}\n",
+    );
+
+    // cppscan with -MM mode should omit system header
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            system_paths: vec![sys_dir.path().to_path_buf()],
+            ..Default::default()
+        },
+        dep_mode: cppscan::DepMode::MM,
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+    let deps = parse_makefile_deps(&result.makefile_output);
+
+    assert!(deps.iter().any(|d| d.contains("user.h")), "should include user.h");
+    assert!(!deps.iter().any(|d| d.contains("sys.h")), "should omit sys.h");
+}
+
+#[test]
+fn conformance_mp_phony_targets() {
+    let tc = TestCase::new();
+    tc.write_file("foo.h", "int foo;\n");
+    tc.write_file("bar.h", "int bar;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#include \"foo.h\"\n#include \"bar.h\"\nint main() {}\n",
+    );
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        output_options: cppscan::OutputOptions {
+            phony: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    // -MP adds phony targets: each dep gets its own empty rule
+    let output = &result.makefile_output;
+
+    // Parse phony targets: lines matching `<path>:\n` without deps
+    let lines: Vec<&str> = output.lines().collect();
+    let mut phony_count = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // A phony target line ends with ':' and the next line is empty or another rule
+        if trimmed.ends_with(':') && !trimmed.contains(' ') && i > 0 {
+            phony_count += 1;
+        }
+    }
+    assert!(phony_count >= 2, "expected at least 2 phony targets, got {}", phony_count);
+}
+
+#[test]
+fn conformance_mt_custom_target() {
+    let tc = TestCase::new();
+    tc.write_file("foo.h", "int foo;\n");
+    let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        output_options: cppscan::OutputOptions {
+            targets: vec!["build/main.o".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(
+        result.makefile_output.starts_with("build/main.o:"),
+        "output should use custom target: {}",
+        result.makefile_output,
+    );
+}
+
+#[test]
+fn conformance_mq_quoted_target() {
+    let tc = TestCase::new();
+    tc.write_file("foo.h", "int foo;\n");
+    let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        output_options: cppscan::OutputOptions {
+            quoted_targets: vec!["$build/main.o".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    // -MQ should escape $ -> $$
+    assert!(
+        result.makefile_output.starts_with("$$build/main.o:"),
+        "output should quote $ in target: {}",
+        result.makefile_output,
+    );
+}
+
+#[test]
+fn conformance_multiple_mt_targets() {
+    let tc = TestCase::new();
+    tc.write_file("foo.h", "int foo;\n");
+    let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        output_options: cppscan::OutputOptions {
+            targets: vec!["a.o".to_string(), "b.o".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(
+        result.makefile_output.starts_with("a.o b.o:"),
+        "output should have multiple targets: {}",
+        result.makefile_output,
+    );
+}
+
+#[test]
+fn conformance_md_writes_dep_file() {
+    let tc = TestCase::new();
+    tc.write_file("foo.h", "int foo;\n");
+    let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        dep_mode: cppscan::DepMode::MD,
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(result.dep_file_path.is_some(), "MD mode should set dep_file_path");
+    let dep_path = result.dep_file_path.unwrap();
+    assert!(
+        dep_path.to_string_lossy().ends_with(".d"),
+        "dep file should have .d extension: {:?}",
+        dep_path,
+    );
+}
+
+#[test]
+fn conformance_mf_custom_dep_file() {
+    let tc = TestCase::new();
+    let source = tc.write_file("main.c", "int main() {}\n");
+    let custom_dep = tc.path().join("custom.deps");
+
+    let options = ScanOptions {
+        dep_mode: cppscan::DepMode::MD,
+        dep_file: Some(custom_dep.clone()),
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert_eq!(result.dep_file_path.unwrap(), custom_dep);
+}
+
+#[test]
+fn conformance_mm_with_mp_phony_omits_system() {
+    let tc = TestCase::new();
+    let sys_dir = tempfile::tempdir().unwrap();
+
+    tc.write_file("user.h", "int user;\n");
+    fs::write(sys_dir.path().join("sys.h"), "int sys;\n").unwrap();
+    let source = tc.write_file(
+        "main.c",
+        "#include \"user.h\"\n#include <sys.h>\nint main() {}\n",
+    );
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            system_paths: vec![sys_dir.path().to_path_buf()],
+            ..Default::default()
+        },
+        dep_mode: cppscan::DepMode::MM,
+        output_options: cppscan::OutputOptions {
+            phony: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    let output = &result.makefile_output;
+    assert!(output.contains("user.h"), "should include user.h");
+    assert!(!output.contains("sys.h"), "should omit sys.h everywhere including phony");
+}
+
 // ---- Unit tests for the dep parser ----
 
 #[test]

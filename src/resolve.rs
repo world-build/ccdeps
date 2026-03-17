@@ -5,6 +5,15 @@
 
 use std::path::{Path, PathBuf};
 
+/// A resolved include with metadata about where it was found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedInclude {
+    /// The resolved file path.
+    pub path: PathBuf,
+    /// Whether this was found in a system include path (`-isystem`).
+    pub is_system: bool,
+}
+
 /// Configuration for include path resolution.
 #[derive(Debug, Clone)]
 pub struct SearchPaths {
@@ -34,18 +43,18 @@ impl SearchPaths {
     /// 2. `-iquote` paths
     /// 3. `-I` paths
     /// 4. `-isystem` paths
-    pub fn resolve_quoted(&self, path: &str, including_file_dir: &Path) -> Option<PathBuf> {
+    pub fn resolve_quoted(&self, path: &str, including_file_dir: &Path) -> Option<ResolvedInclude> {
         // 1. Current file's directory
         let candidate = including_file_dir.join(path);
         if candidate.is_file() {
-            return Some(candidate);
+            return Some(ResolvedInclude { path: candidate, is_system: false });
         }
 
         // 2. -iquote paths
         for dir in &self.quote_paths {
             let candidate = dir.join(path);
             if candidate.is_file() {
-                return Some(candidate);
+                return Some(ResolvedInclude { path: candidate, is_system: false });
             }
         }
 
@@ -58,18 +67,18 @@ impl SearchPaths {
     /// Search order:
     /// 1. `-I` paths
     /// 2. `-isystem` paths
-    pub fn resolve_angle(&self, path: &str) -> Option<PathBuf> {
+    pub fn resolve_angle(&self, path: &str) -> Option<ResolvedInclude> {
         for dir in &self.include_paths {
             let candidate = dir.join(path);
             if candidate.is_file() {
-                return Some(candidate);
+                return Some(ResolvedInclude { path: candidate, is_system: false });
             }
         }
 
         for dir in &self.system_paths {
             let candidate = dir.join(path);
             if candidate.is_file() {
-                return Some(candidate);
+                return Some(ResolvedInclude { path: candidate, is_system: true });
             }
         }
 
@@ -90,7 +99,7 @@ mod tests {
 
         let paths = SearchPaths::default();
         let result = paths.resolve_quoted("foo.h", dir.path());
-        assert_eq!(result, Some(header));
+        assert_eq!(result, Some(ResolvedInclude { path: header, is_system: false }));
     }
 
     #[test]
@@ -104,7 +113,21 @@ mod tests {
             ..Default::default()
         };
         let result = paths.resolve_angle("bar.h");
-        assert_eq!(result, Some(header));
+        assert_eq!(result, Some(ResolvedInclude { path: header, is_system: false }));
+    }
+
+    #[test]
+    fn test_resolve_system_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = dir.path().join("sys.h");
+        fs::write(&header, "// sys").unwrap();
+
+        let paths = SearchPaths {
+            system_paths: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = paths.resolve_angle("sys.h");
+        assert_eq!(result, Some(ResolvedInclude { path: header, is_system: true }));
     }
 
     #[test]

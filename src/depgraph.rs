@@ -15,7 +15,7 @@ use crate::directive::{self, Directive, IncludeStyle};
 use crate::eval;
 use crate::macros::MacroTable;
 use crate::minimize;
-use crate::resolve::SearchPaths;
+use crate::resolve::{ResolvedInclude, SearchPaths};
 
 /// Cached information about a scanned file.
 #[derive(Debug)]
@@ -24,6 +24,15 @@ pub struct FileInfo {
     pub minimized: minimize::MinimizedSource,
     /// Original file size (for stats).
     pub original_size: usize,
+}
+
+/// A dependency entry with metadata about how it was resolved.
+#[derive(Debug, Clone)]
+pub struct DepEntry {
+    /// The canonical file path.
+    pub path: PathBuf,
+    /// Whether this dependency was found via a system include path (`-isystem`).
+    pub is_system: bool,
 }
 
 /// Thread-safe cache of scanned files.
@@ -43,7 +52,7 @@ pub fn collect_deps(
     search_paths: &SearchPaths,
     cache: &FileCache,
     initial_defines: &[(String, Option<String>)],
-) -> Result<Vec<PathBuf>, std::io::Error> {
+) -> Result<Vec<DepEntry>, std::io::Error> {
     let mut deps = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut macros = MacroTable::new();
@@ -139,7 +148,7 @@ fn collect_deps_recursive(
     file_path: &Path,
     search_paths: &SearchPaths,
     cache: &FileCache,
-    deps: &mut Vec<PathBuf>,
+    deps: &mut Vec<DepEntry>,
     visited: &mut std::collections::HashSet<PathBuf>,
     macros: &mut MacroTable,
 ) -> Result<(), std::io::Error> {
@@ -258,8 +267,8 @@ fn collect_deps_recursive(
                     }
                 };
 
-                if let Some(resolved) = resolved {
-                    let canonical = match std::fs::canonicalize(&resolved) {
+                if let Some(ResolvedInclude { path: resolved_path, is_system }) = resolved {
+                    let canonical = match std::fs::canonicalize(&resolved_path) {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -284,15 +293,15 @@ fn collect_deps_recursive(
                         };
 
                         if dominated {
-                            if !deps.contains(&canonical) {
-                                deps.push(canonical);
+                            if !deps.iter().any(|d| d.path == canonical) {
+                                deps.push(DepEntry { path: canonical, is_system });
                             }
                             continue;
                         }
                     }
 
                     visited.insert(canonical.clone());
-                    deps.push(canonical.clone());
+                    deps.push(DepEntry { path: canonical.clone(), is_system });
 
                     collect_deps_recursive(
                         &canonical,
@@ -388,7 +397,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let guarded_count = deps
             .iter()
-            .filter(|p| p.file_name().unwrap() == "guarded.h")
+            .filter(|d| d.path.file_name().unwrap() == "guarded.h")
             .count();
         assert_eq!(guarded_count, 1);
     }
@@ -412,7 +421,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
@@ -437,7 +446,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
@@ -462,7 +471,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
@@ -488,7 +497,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(!names.contains(&"a.h".to_string()));
         assert!(names.contains(&"b.h".to_string()));
@@ -514,7 +523,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"inner.h".to_string()));
         assert!(!names.contains(&"skip.h".to_string()));
@@ -545,7 +554,7 @@ mod tests {
         .unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
@@ -574,7 +583,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"config.h".to_string()));
         assert!(names.contains(&"feature.h".to_string()));
@@ -598,7 +607,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"target.h".to_string()));
     }
@@ -621,7 +630,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"real.h".to_string()));
     }
@@ -645,7 +654,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
@@ -670,7 +679,7 @@ mod tests {
             collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
         let names: Vec<_> = deps
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert!(names.contains(&"exists.h".to_string()));
         assert!(!names.contains(&"fallback.h".to_string()));
