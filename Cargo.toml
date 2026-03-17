@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    ".",
+    "crates/cppscan-cli",
+]
+
+[package]
+name = "cppscan"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance C preprocessor dependency scanner"
+license = "MIT"
+repository = "https://github.com/hinshun/cppscan"
+
+[lib]
+name = "cppscan"
+
+[dependencies]
+# Parallelism
+rayon = "1"
+
+# Fast concurrent collections
+dashmap = "6"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# SIMD-accelerated byte scanning
+memchr = "2"
+
+# Arena allocation
+bumpalo = { version = "3", features = ["collections"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Path handling
+camino = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+pretty_assertions = "1"
+tempfile = "3"
+insta = { version = "1", features = ["yaml"] }
+
+[[bench]]
+name = "scan"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = true
