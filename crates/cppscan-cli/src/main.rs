@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use cppscan::{DepMode, OutputOptions, ScanOptions, Scanner};
 use std::path::PathBuf;
+use std::io::BufRead;
 
 /// High-performance C preprocessor dependency scanner.
 ///
@@ -78,6 +79,39 @@ struct Args {
     /// Treat missing headers as generated (add to deps instead of erroring).
     #[arg(long = "MG")]
     mg: bool,
+
+    /// Process trigraphs (off by default, matching modern gcc/clang).
+    #[arg(long = "trigraphs")]
+    trigraphs: bool,
+}
+
+/// Expand `@file` response file arguments into the argument list.
+fn expand_response_files(args: impl Iterator<Item = String>) -> Vec<String> {
+    let mut result = Vec::new();
+    for arg in args {
+        if let Some(path) = arg.strip_prefix('@') {
+            if let Ok(file) = std::fs::File::open(path) {
+                let reader = std::io::BufReader::new(file);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        let line = line.trim().to_string();
+                        if !line.is_empty() {
+                            // Split on whitespace (simple response file format)
+                            for token in line.split_whitespace() {
+                                result.push(token.to_string());
+                            }
+                        }
+                    }
+                }
+            } else {
+                // If file can't be opened, keep the argument as-is
+                result.push(arg);
+            }
+        } else {
+            result.push(arg);
+        }
+    }
+    result
 }
 
 fn main() -> Result<()> {
@@ -87,7 +121,9 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    // Expand @file response file arguments before clap parsing
+    let expanded_args = expand_response_files(std::env::args());
+    let args = Args::parse_from(expanded_args);
 
     // Configure thread pool
     if args.jobs > 0 {
@@ -145,6 +181,8 @@ fn main() -> Result<()> {
         dep_mode,
         dep_file: args.mf,
         output_options,
+        missing_as_generated: args.mg,
+        trigraphs: args.trigraphs,
     };
 
     let scanner = Scanner::new(options);

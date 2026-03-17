@@ -47,5 +47,5 @@ pub mod output;
 pub mod scanner;
 
 pub use scanner::{Scanner, ScanResult, ScanOptions, DepMode};
-pub use depgraph::DepEntry;
+pub use depgraph::{DepEntry, DepCollectOptions};
 pub use output::OutputOptions;

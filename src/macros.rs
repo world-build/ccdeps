@@ -32,6 +32,9 @@ pub enum MacroDef {
 pub struct MacroTable {
     macros: HashMap<String, MacroDef>,
     counter: u32,
+    /// Stack for `#pragma push_macro` / `pop_macro`.
+    /// Each entry is (macro_name, saved_definition).
+    macro_stack: Vec<(String, Option<MacroDef>)>,
 }
 
 impl MacroTable {
@@ -39,6 +42,7 @@ impl MacroTable {
         Self {
             macros: HashMap::new(),
             counter: 0,
+            macro_stack: Vec::new(),
         }
     }
 
@@ -138,6 +142,24 @@ impl MacroTable {
     /// Get the macro definition (for function-like expansion).
     pub fn get_def(&self, name: &str) -> Option<&MacroDef> {
         self.macros.get(name)
+    }
+
+    /// Save the current definition of a macro onto the stack (`#pragma push_macro`).
+    pub fn push_macro(&mut self, name: &str) {
+        let current = self.macros.get(name).cloned();
+        self.macro_stack.push((name.to_string(), current));
+    }
+
+    /// Restore a previously pushed macro definition (`#pragma pop_macro`).
+    pub fn pop_macro(&mut self, name: &str) {
+        // Search stack from top for matching name
+        if let Some(idx) = self.macro_stack.iter().rposition(|(n, _)| n == name) {
+            let (_, saved) = self.macro_stack.remove(idx);
+            match saved {
+                Some(def) => { self.macros.insert(name.to_string(), def); }
+                None => { self.macros.remove(name); }
+            }
+        }
     }
 
     /// Get and increment the `__COUNTER__` value.

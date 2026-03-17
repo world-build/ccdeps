@@ -22,6 +22,28 @@ pub struct MinimizedSource {
     pub has_pragma_once: bool,
 }
 
+/// Options controlling source minimization.
+#[derive(Debug, Clone, Default)]
+pub struct MinimizeOptions {
+    /// Whether to process trigraphs (`??=` → `#`, etc.).
+    /// Off by default (matching modern gcc/clang defaults).
+    pub trigraphs: bool,
+}
+
+/// Minimize a source file with options (trigraph support, etc.).
+pub fn minimize_with_options(source: &[u8], options: &MinimizeOptions) -> MinimizedSource {
+    if options.trigraphs && source.windows(3).any(|w| w[0] == b'?' && w[1] == b'?') {
+        let replaced = replace_trigraphs(source);
+        return minimize_inner(&replaced);
+    }
+    // Check for digraph `%:` → `#` (always active, not controlled by -trigraphs)
+    if source.windows(2).any(|w| w[0] == b'%' && w[1] == b':') {
+        let replaced = replace_digraphs(source);
+        return minimize_inner(&replaced);
+    }
+    minimize_inner(source)
+}
+
 /// Minimize a source file, keeping only preprocessor directive lines.
 ///
 /// The minimizer scans for lines beginning with `#` (after optional whitespace)
@@ -29,6 +51,10 @@ pub struct MinimizedSource {
 /// and comments (both `//` and `/* */`) so that `#` characters inside them are
 /// never mistaken for directives.
 pub fn minimize(source: &[u8]) -> MinimizedSource {
+    minimize_inner(source)
+}
+
+fn minimize_inner(source: &[u8]) -> MinimizedSource {
     let mut result = MinimizedSource {
         content: Vec::with_capacity(source.len() / 4),
         has_include_guard: false,
@@ -240,6 +266,73 @@ fn skip_hash_and_whitespace(s: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(skip_whitespace(&s[1..]))
+}
+
+/// Replace C trigraph sequences with their single-character equivalents.
+/// Per ISO C: `??=` → `#`, `??/` → `\`, `??'` → `^`, `??(` → `[`,
+/// `??)` → `]`, `??!` → `|`, `??<` → `{`, `??>` → `}`, `??-` → `~`.
+fn replace_trigraphs(source: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(source.len());
+    let mut i = 0;
+    while i < source.len() {
+        if i + 2 < source.len() && source[i] == b'?' && source[i + 1] == b'?' {
+            let replacement = match source[i + 2] {
+                b'=' => Some(b'#'),
+                b'/' => Some(b'\\'),
+                b'\'' => Some(b'^'),
+                b'(' => Some(b'['),
+                b')' => Some(b']'),
+                b'!' => Some(b'|'),
+                b'<' => Some(b'{'),
+                b'>' => Some(b'}'),
+                b'-' => Some(b'~'),
+                _ => None,
+            };
+            if let Some(r) = replacement {
+                result.push(r);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(source[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Replace C digraphs relevant to preprocessing: `%:` → `#`, `%:%:` → `##`.
+fn replace_digraphs(source: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(source.len());
+    let mut i = 0;
+    while i < source.len() {
+        if i + 3 < source.len()
+            && source[i] == b'%' && source[i + 1] == b':'
+            && source[i + 2] == b'%' && source[i + 3] == b':'
+        {
+            result.push(b'#');
+            result.push(b'#');
+            i += 4;
+            continue;
+        }
+        if i + 1 < source.len() && source[i] == b'%' && source[i + 1] == b':' {
+            result.push(b'#');
+            i += 2;
+            continue;
+        }
+        result.push(source[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Join line continuations (`\` + newline) in a directive line.
+/// This is needed for directives like `#inc\nlude` where the keyword is
+/// split across lines.
+pub fn join_line_continuations(line: &str) -> String {
+    if !line.contains("\\\n") {
+        return line.to_string();
+    }
+    line.replace("\\\n", "").replace("\\\r\n", "")
 }
 
 fn extract_identifier(s: &[u8]) -> Option<String> {

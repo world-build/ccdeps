@@ -637,6 +637,224 @@ fn conformance_mm_with_mp_phony_omits_system() {
     assert!(!output.contains("sys.h"), "should omit sys.h everywhere including phony");
 }
 
+// ---- Phase 5: Edge Cases & Full Conformance ----
+
+#[test]
+fn conformance_include_next() {
+    // #include_next searches from the next directory in the search path
+    let tc = TestCase::new();
+
+    // Create two directories with the same header name
+    tc.write_file("dir1/wrapper.h", "#include_next <wrapper.h>\n");
+    tc.write_file("dir2/wrapper.h", "int wrapped;\n");
+    let source = tc.write_file("main.c", "#include <wrapper.h>\nint main() {}\n");
+
+    let dir1 = tc.path().join("dir1");
+    let dir2 = tc.path().join("dir2");
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![dir1, dir2],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+    let deps = parse_makefile_deps(&result.makefile_output);
+
+    // Should find both wrapper.h files (dir1 and dir2)
+    let wrapper_count = deps.iter().filter(|d| d.contains("wrapper.h")).count();
+    assert_eq!(wrapper_count, 2, "should find both wrapper.h files: {:?}", deps);
+}
+
+#[test]
+fn conformance_import_once_only() {
+    // #import should only include a file once (Objective-C semantics)
+    let tc = TestCase::new();
+
+    tc.write_file("imported.h", "#define IMPORTED 1\n");
+    let source = tc.write_file(
+        "main.c",
+        "#import \"imported.h\"\n#import \"imported.h\"\nint main() {}\n",
+    );
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+    let deps = parse_makefile_deps(&result.makefile_output);
+
+    let imported_count = deps.iter().filter(|d| d.contains("imported.h")).count();
+    assert_eq!(imported_count, 1, "imported.h should appear exactly once: {:?}", deps);
+}
+
+#[test]
+fn conformance_pragma_push_pop_macro() {
+    let tc = TestCase::new();
+
+    tc.write_file("yes.h", "int yes;\n");
+    tc.write_file("no.h", "int no;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define FOO 1\n\
+         #pragma push_macro(\"FOO\")\n\
+         #undef FOO\n\
+         #ifndef FOO\n\
+         #include \"yes.h\"\n\
+         #endif\n\
+         #pragma pop_macro(\"FOO\")\n\
+         #if FOO\n\
+         #include \"yes.h\"\n\
+         #else\n\
+         #include \"no.h\"\n\
+         #endif\n\
+         int main() {}\n",
+    );
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(result.makefile_output.contains("yes.h"), "should include yes.h");
+    assert!(!result.makefile_output.contains("no.h"), "should not include no.h (FOO restored by pop_macro)");
+}
+
+#[test]
+fn conformance_mg_missing_headers() {
+    let tc = TestCase::new();
+
+    let source = tc.write_file(
+        "main.c",
+        "#include \"generated.h\"\nint main() {}\n",
+    );
+
+    let options = ScanOptions {
+        missing_as_generated: true,
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(
+        result.makefile_output.contains("generated.h"),
+        "with -MG, missing headers should appear in deps: {}",
+        result.makefile_output,
+    );
+}
+
+#[test]
+fn conformance_trigraph_hash() {
+    let tc = TestCase::new();
+
+    tc.write_file("foo.h", "int foo;\n");
+    // ??= is the trigraph for #
+    let source = tc.write_file(
+        "main.c",
+        "??=include \"foo.h\"\nint main() {}\n",
+    );
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        trigraphs: true,
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(
+        result.makefile_output.contains("foo.h"),
+        "trigraph ??= should be treated as #: {}",
+        result.makefile_output,
+    );
+}
+
+#[test]
+fn conformance_digraph_hash() {
+    let tc = TestCase::new();
+
+    tc.write_file("foo.h", "int foo;\n");
+    // %: is the digraph for #
+    let source = tc.write_file(
+        "main.c",
+        "%:include \"foo.h\"\nint main() {}\n",
+    );
+
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    assert!(
+        result.makefile_output.contains("foo.h"),
+        "digraph %: should be treated as #: {}",
+        result.makefile_output,
+    );
+}
+
+#[test]
+fn conformance_pragma_system_header_mm() {
+    // #pragma GCC system_header should cause the file's includes to be treated as system
+    let tc = TestCase::new();
+
+    tc.write_file("inner.h", "int inner;\n");
+    tc.write_file(
+        "sys_wrapper.h",
+        "#pragma GCC system_header\n#include \"inner.h\"\n",
+    );
+    let source = tc.write_file(
+        "main.c",
+        "#include \"sys_wrapper.h\"\nint main() {}\n",
+    );
+
+    // With -MM, system headers should be omitted. sys_wrapper.h itself is not system
+    // (it's found via a non-system path), but inner.h included from it is treated as system
+    // because of #pragma GCC system_header
+    let options = ScanOptions {
+        search_paths: cppscan::resolve::SearchPaths {
+            include_paths: vec![tc.path().to_path_buf()],
+            ..Default::default()
+        },
+        dep_mode: cppscan::DepMode::MM,
+        ..Default::default()
+    };
+
+    let scanner = Scanner::new(options);
+    let result = scanner.scan_file(&source).unwrap();
+
+    // sys_wrapper.h should still appear (it was included from a non-system path)
+    assert!(result.makefile_output.contains("sys_wrapper.h"),
+            "sys_wrapper.h should be in deps: {}", result.makefile_output);
+    // inner.h should be omitted with -MM since it's under system_header pragma
+    assert!(!result.makefile_output.contains("inner.h"),
+            "inner.h should be omitted with -MM under system_header: {}", result.makefile_output);
+}
+
 // ---- Unit tests for the dep parser ----
 
 #[test]

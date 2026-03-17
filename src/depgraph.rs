@@ -11,11 +11,11 @@ use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::directive::{self, Directive, IncludeStyle};
+use crate::directive::{self, Directive, IncludeDirective, IncludeStyle};
 use crate::eval;
 use crate::intern::PathInterner;
 use crate::macros::MacroTable;
-use crate::minimize;
+use crate::minimize::{self, MinimizeOptions};
 use crate::resolve::{ResolvedInclude, SearchPaths};
 
 /// Files at or above this size use memory-mapped I/O. Below this threshold,
@@ -44,6 +44,15 @@ pub struct DepEntry {
 /// Thread-safe cache of scanned files.
 pub type FileCache = Arc<DashMap<PathBuf, Arc<FileInfo>>>;
 
+/// Options for dependency collection.
+#[derive(Debug, Clone, Default)]
+pub struct DepCollectOptions {
+    /// Treat missing headers as generated (`-MG`).
+    pub missing_as_generated: bool,
+    /// Process trigraphs in source files.
+    pub trigraphs: bool,
+}
+
 /// Create a new empty file cache.
 pub fn new_file_cache() -> FileCache {
     Arc::new(DashMap::new())
@@ -58,11 +67,16 @@ pub fn collect_deps(
     search_paths: &SearchPaths,
     cache: &FileCache,
     initial_defines: &[(String, Option<String>)],
+    options: &DepCollectOptions,
 ) -> Result<Vec<DepEntry>, std::io::Error> {
     let mut deps = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut macros = MacroTable::new();
     let interner = PathInterner::new();
+    let mut import_once = std::collections::HashSet::new();
+    let minimize_opts = MinimizeOptions {
+        trigraphs: options.trigraphs,
+    };
 
     // Apply command-line defines
     for (name, value) in initial_defines {
@@ -80,6 +94,10 @@ pub fn collect_deps(
         &mut visited,
         &mut macros,
         &interner,
+        &mut import_once,
+        options,
+        &minimize_opts,
+        false, // is_system_header
     )?;
 
     Ok(deps)
@@ -160,8 +178,12 @@ fn collect_deps_recursive(
     visited: &mut std::collections::HashSet<PathBuf>,
     macros: &mut MacroTable,
     interner: &PathInterner,
+    import_once: &mut std::collections::HashSet<PathBuf>,
+    options: &DepCollectOptions,
+    minimize_opts: &MinimizeOptions,
+    mut is_system_header: bool,
 ) -> Result<(), std::io::Error> {
-    let info = get_or_scan(file_path, cache)?;
+    let info = get_or_scan(file_path, cache, minimize_opts)?;
 
     let content = String::from_utf8_lossy(&info.minimized.content);
     let mut cond_stack = ConditionalStack::new();
@@ -176,6 +198,15 @@ fn collect_deps_recursive(
         if line.is_empty() {
             continue;
         }
+
+        // Join line continuations so split keywords like `#inc\nlude` work
+        let joined;
+        let line = if line.contains("\\\n") {
+            joined = minimize::join_line_continuations(line);
+            joined.as_str()
+        } else {
+            line
+        };
 
         let directive = match directive::parse_directive(line) {
             Some(d) => d,
@@ -235,9 +266,6 @@ fn collect_deps_recursive(
 
         match directive {
             Directive::Define { name, value } => {
-                // Detect function-like macros: value starts with '(' immediately
-                // after the name (no space). `#define FOO(x) x+1` → value="(x) x+1"
-                // `#define FOO (x)` → value=" (x)" (space = object-like)
                 if let Some(val) = value {
                     if val.starts_with('(') {
                         macros.define_function_like(name, val);
@@ -251,85 +279,224 @@ fn collect_deps_recursive(
             Directive::Undef { name } => {
                 macros.undef(name);
             }
-            Directive::Include(inc) => {
-                let resolved = match inc.style {
-                    IncludeStyle::Quoted => {
-                        let dir = file_path.parent().unwrap_or(Path::new("."));
-                        search_paths.resolve_quoted(inc.path, dir)
-                    }
-                    IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
-                    IncludeStyle::Computed => {
-                        // Macro-expand the tokens and re-parse as "path" or <path>
-                        let expanded = macros.expand(inc.path);
-                        let expanded = expanded.trim();
-                        if let Some(path) = extract_include_path(expanded) {
-                            let is_angle = expanded.starts_with('<');
-                            if is_angle {
-                                search_paths.resolve_angle(&path)
-                            } else {
-                                let dir = file_path.parent().unwrap_or(Path::new("."));
-                                search_paths.resolve_quoted(&path, dir)
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-                };
-
+            Directive::Pragma { tokens } => {
+                handle_pragma(tokens, macros, &mut is_system_header);
+            }
+            Directive::Include(ref inc) => {
+                handle_include(
+                    inc, file_path, search_paths, cache, deps, visited, macros,
+                    interner, import_once, options, minimize_opts, is_system_header,
+                    false, // is_import
+                )?;
+            }
+            Directive::IncludeNext(ref inc) => {
+                // #include_next: resolve starting from the next search directory
+                let resolved = search_paths.resolve_include_next(
+                    inc.path,
+                    current_dir,
+                );
                 if let Some(ResolvedInclude { path: resolved_path, is_system }) = resolved {
-                    let canonical = match std::fs::canonicalize(&resolved_path) {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-
-                    if visited.contains(&canonical) {
-                        continue;
-                    }
-
-                    // Check include guard / pragma once
-                    if let Some(cached) = cache.get(&canonical) {
-                        let dominated = if cached.minimized.has_pragma_once {
-                            true
-                        } else if cached.minimized.has_include_guard {
-                            // Guard is dominated if already defined
-                            if let Some(ref guard) = cached.minimized.guard_macro {
-                                macros.is_defined(guard)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if dominated {
-                            let interned = interner.intern(&canonical);
-                            if !deps.iter().any(|d| *d.path == *interned) {
-                                deps.push(DepEntry { path: interned, is_system });
-                            }
-                            continue;
-                        }
-                    }
-
-                    visited.insert(canonical.clone());
-                    let interned = interner.intern_owned(canonical.clone());
-                    deps.push(DepEntry { path: interned, is_system });
-
-                    collect_deps_recursive(
-                        &canonical,
-                        search_paths,
-                        cache,
-                        deps,
-                        visited,
-                        macros,
-                        interner,
+                    process_resolved_include(
+                        &resolved_path, is_system || is_system_header,
+                        search_paths, cache, deps, visited, macros,
+                        interner, import_once, options, minimize_opts, false,
                     )?;
+                } else if options.missing_as_generated {
+                    add_missing_dep(inc.path, deps, interner);
                 }
+            }
+            Directive::Import(ref inc) => {
+                handle_include(
+                    inc, file_path, search_paths, cache, deps, visited, macros,
+                    interner, import_once, options, minimize_opts, is_system_header,
+                    true, // is_import
+                )?;
             }
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Handle `#pragma` directives that affect dependency scanning.
+fn handle_pragma(tokens: &str, macros: &mut MacroTable, is_system_header: &mut bool) {
+    let tokens = tokens.trim();
+
+    // #pragma GCC system_header
+    if tokens == "GCC system_header" || tokens == "clang system_header" {
+        *is_system_header = true;
+        return;
+    }
+
+    // #pragma push_macro("name")
+    if let Some(rest) = tokens.strip_prefix("push_macro") {
+        if let Some(name) = extract_pragma_macro_name(rest) {
+            macros.push_macro(name);
+        }
+        return;
+    }
+
+    // #pragma pop_macro("name")
+    if let Some(rest) = tokens.strip_prefix("pop_macro") {
+        if let Some(name) = extract_pragma_macro_name(rest) {
+            macros.pop_macro(name);
+        }
+    }
+}
+
+/// Extract macro name from `("name")` in pragma push_macro/pop_macro.
+fn extract_pragma_macro_name(s: &str) -> Option<&str> {
+    let s = s.trim();
+    let s = s.strip_prefix('(')?;
+    let s = s.trim();
+    let s = s.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(&s[..end])
+}
+
+/// Handle an `#include` or `#import` directive.
+fn handle_include(
+    inc: &IncludeDirective<'_>,
+    file_path: &Path,
+    search_paths: &SearchPaths,
+    cache: &FileCache,
+    deps: &mut Vec<DepEntry>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    macros: &mut MacroTable,
+    interner: &PathInterner,
+    import_once: &mut std::collections::HashSet<PathBuf>,
+    options: &DepCollectOptions,
+    minimize_opts: &MinimizeOptions,
+    is_system_header: bool,
+    is_import: bool,
+) -> Result<(), std::io::Error> {
+    let resolved = match inc.style {
+        IncludeStyle::Quoted => {
+            let dir = file_path.parent().unwrap_or(Path::new("."));
+            search_paths.resolve_quoted(inc.path, dir)
+        }
+        IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
+        IncludeStyle::Computed => {
+            let expanded = macros.expand(inc.path);
+            let expanded = expanded.trim().to_string();
+            if let Some(path) = extract_include_path(&expanded) {
+                let is_angle = expanded.starts_with('<');
+                if is_angle {
+                    search_paths.resolve_angle(&path)
+                } else {
+                    let dir = file_path.parent().unwrap_or(Path::new("."));
+                    search_paths.resolve_quoted(&path, dir)
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    };
+
+    if let Some(ResolvedInclude { path: resolved_path, is_system }) = resolved {
+        process_resolved_include(
+            &resolved_path, is_system || is_system_header,
+            search_paths, cache, deps, visited, macros,
+            interner, import_once, options, minimize_opts, is_import,
+        )?;
+    } else if options.missing_as_generated {
+        add_missing_dep(inc.path, deps, interner);
+    }
+
+    Ok(())
+}
+
+/// Process a resolved include path: check guards, add to deps, recurse.
+fn process_resolved_include(
+    resolved_path: &Path,
+    is_system: bool,
+    search_paths: &SearchPaths,
+    cache: &FileCache,
+    deps: &mut Vec<DepEntry>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    macros: &mut MacroTable,
+    interner: &PathInterner,
+    import_once: &mut std::collections::HashSet<PathBuf>,
+    options: &DepCollectOptions,
+    minimize_opts: &MinimizeOptions,
+    is_import: bool,
+) -> Result<(), std::io::Error> {
+    let canonical = match std::fs::canonicalize(resolved_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+
+    // #import: skip if already imported
+    if import_once.contains(&canonical) {
+        let interned = interner.intern(&canonical);
+        if !deps.iter().any(|d| *d.path == *interned) {
+            deps.push(DepEntry { path: interned, is_system });
+        }
+        return Ok(());
+    }
+
+    if visited.contains(&canonical) {
+        return Ok(());
+    }
+
+    // Check include guard / pragma once
+    if let Some(cached) = cache.get(&canonical) {
+        let dominated = if cached.minimized.has_pragma_once {
+            true
+        } else if cached.minimized.has_include_guard {
+            if let Some(ref guard) = cached.minimized.guard_macro {
+                macros.is_defined(guard)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if dominated {
+            let interned = interner.intern(&canonical);
+            if !deps.iter().any(|d| *d.path == *interned) {
+                deps.push(DepEntry { path: interned, is_system });
+            }
+            return Ok(());
+        }
+    }
+
+    visited.insert(canonical.clone());
+
+    // Mark as import-once if this is #import
+    if is_import {
+        import_once.insert(canonical.clone());
+    }
+
+    let interned = interner.intern_owned(canonical.clone());
+    deps.push(DepEntry { path: interned, is_system });
+
+    collect_deps_recursive(
+        &canonical,
+        search_paths,
+        cache,
+        deps,
+        visited,
+        macros,
+        interner,
+        import_once,
+        options,
+        minimize_opts,
+        is_system,
+    )?;
+
+    Ok(())
+}
+
+/// Add a missing header as a generated dependency (`-MG`).
+fn add_missing_dep(path: &str, deps: &mut Vec<DepEntry>, interner: &PathInterner) {
+    let p = Path::new(path);
+    let interned = interner.intern(p);
+    if !deps.iter().any(|d| *d.path == *interned) {
+        deps.push(DepEntry { path: interned, is_system: false });
+    }
 }
 
 /// Extract the path from an expanded include token sequence.
@@ -350,7 +517,11 @@ fn extract_include_path(expanded: &str) -> Option<String> {
 /// Uses memory-mapped I/O for files >= 4 KB (avoids the allocation + copy of
 /// `std::fs::read`) and plain `read` for smaller files (avoids mmap's fixed
 /// VMA setup overhead).
-fn get_or_scan(path: &Path, cache: &FileCache) -> Result<Arc<FileInfo>, std::io::Error> {
+fn get_or_scan(
+    path: &Path,
+    cache: &FileCache,
+    minimize_opts: &MinimizeOptions,
+) -> Result<Arc<FileInfo>, std::io::Error> {
     if let Some(info) = cache.get(path) {
         return Ok(Arc::clone(&info));
     }
@@ -360,25 +531,17 @@ fn get_or_scan(path: &Path, cache: &FileCache) -> Result<Arc<FileInfo>, std::io:
     let file_size = metadata.len();
 
     let minimized = if file_size >= MMAP_THRESHOLD {
-        // Large file: memory-map for zero-copy access.
-        // SAFETY: We hold the file open for the duration of the mmap, and the
-        // minimizer only reads the mapped region. Concurrent modification by
-        // another process would be a pre-existing build-system bug.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        // Hint to the kernel that we'll read sequentially.
         #[cfg(unix)]
         {
             mmap.advise(memmap2::Advice::Sequential).ok();
         }
 
-        let result = minimize::minimize(&mmap);
-        // mmap is dropped here, unmapping the region
-        result
+        minimize::minimize_with_options(&mmap, minimize_opts)
     } else {
-        // Small file: plain read is faster than mmap overhead.
         let source = std::fs::read(path)?;
-        minimize::minimize(&source)
+        minimize::minimize_with_options(&source, minimize_opts)
     };
 
     let info = Arc::new(FileInfo {
@@ -408,7 +571,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("a.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("a.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         assert_eq!(deps.len(), 2); // b.h, c.h
     }
 
@@ -432,7 +595,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let guarded_count = deps
             .iter()
             .filter(|d| d.path.file_name().unwrap() == "guarded.h")
@@ -456,7 +619,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -481,7 +644,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -506,7 +669,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -532,7 +695,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -558,7 +721,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -588,6 +751,7 @@ mod tests {
             &search_paths,
             &cache,
             &defines,
+            &DepCollectOptions::default(),
         )
         .unwrap();
         let names: Vec<_> = deps
@@ -618,7 +782,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -642,7 +806,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -665,7 +829,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -689,7 +853,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -714,7 +878,7 @@ mod tests {
         let cache = new_file_cache();
 
         let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())

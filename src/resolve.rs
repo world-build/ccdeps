@@ -84,6 +84,37 @@ impl SearchPaths {
 
         None
     }
+
+    /// Resolve `#include_next` — searches starting from the **next** directory
+    /// after `found_in_dir` in the search path order.
+    ///
+    /// This is a GNU extension used heavily in system headers (e.g., glibc wrappers).
+    pub fn resolve_include_next(
+        &self,
+        path: &str,
+        found_in_dir: &Path,
+    ) -> Option<ResolvedInclude> {
+        let all_paths = self.quote_paths.iter()
+            .chain(self.include_paths.iter())
+            .chain(self.system_paths.iter());
+
+        let mut found = false;
+        for dir in all_paths {
+            if !found {
+                if dir == found_in_dir {
+                    found = true;
+                }
+                continue;
+            }
+            let candidate = dir.join(path);
+            if candidate.is_file() {
+                let is_system = self.system_paths.iter().any(|sp| sp == dir);
+                return Some(ResolvedInclude { path: candidate, is_system });
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]

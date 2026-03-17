@@ -7,6 +7,10 @@
 pub enum Directive<'a> {
     /// `#include "path"` or `#include <path>`
     Include(IncludeDirective<'a>),
+    /// `#include_next "path"` or `#include_next <path>` (GNU extension)
+    IncludeNext(IncludeDirective<'a>),
+    /// `#import "path"` or `#import <path>` (Objective-C, once-only semantics)
+    Import(IncludeDirective<'a>),
     /// `#define MACRO ...`
     Define { name: &'a str, value: Option<&'a str> },
     /// `#undef MACRO`
@@ -59,8 +63,14 @@ pub fn parse_directive(line: &str) -> Option<Directive<'_>> {
     let line = line.trim();
     let after_hash = line.strip_prefix('#')?.trim_start();
 
+    if let Some(rest) = strip_keyword(after_hash, "include_next") {
+        return Some(parse_include_next(rest));
+    }
     if let Some(rest) = strip_keyword(after_hash, "include") {
         return Some(parse_include(rest));
+    }
+    if let Some(rest) = strip_keyword(after_hash, "import") {
+        return Some(parse_import(rest));
     }
     if let Some(rest) = strip_keyword(after_hash, "define") {
         let rest = rest.trim_start();
@@ -130,22 +140,34 @@ pub fn parse_directive(line: &str) -> Option<Directive<'_>> {
 }
 
 fn parse_include(rest: &str) -> Directive<'_> {
+    Directive::Include(parse_include_path(rest))
+}
+
+fn parse_include_next(rest: &str) -> Directive<'_> {
+    Directive::IncludeNext(parse_include_path(rest))
+}
+
+fn parse_import(rest: &str) -> Directive<'_> {
+    Directive::Import(parse_include_path(rest))
+}
+
+fn parse_include_path(rest: &str) -> IncludeDirective<'_> {
     let rest = rest.trim_start();
     if let Some(path) = extract_quoted(rest, '"', '"') {
-        Directive::Include(IncludeDirective {
+        IncludeDirective {
             path,
             style: IncludeStyle::Quoted,
-        })
+        }
     } else if let Some(path) = extract_quoted(rest, '<', '>') {
-        Directive::Include(IncludeDirective {
+        IncludeDirective {
             path,
             style: IncludeStyle::Angle,
-        })
+        }
     } else {
-        Directive::Include(IncludeDirective {
+        IncludeDirective {
             path: rest.trim(),
             style: IncludeStyle::Computed,
-        })
+        }
     }
 }
 

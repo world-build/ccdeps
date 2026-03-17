@@ -51,6 +51,11 @@ pub struct ScanOptions {
     pub dep_file: Option<PathBuf>,
     /// Output formatting options (`-MT`, `-MQ`, `-MP`).
     pub output_options: OutputOptions,
+    /// Treat missing headers as generated files (`-MG`).
+    /// Adds them to the dependency list instead of erroring.
+    pub missing_as_generated: bool,
+    /// Whether to process trigraphs (`-trigraphs`).
+    pub trigraphs: bool,
 }
 
 impl Default for ScanOptions {
@@ -62,6 +67,8 @@ impl Default for ScanOptions {
             dep_mode: DepMode::default(),
             dep_file: None,
             output_options: OutputOptions::default(),
+            missing_as_generated: false,
+            trigraphs: false,
         }
     }
 }
@@ -96,11 +103,16 @@ impl Scanner {
 
     /// Scan a single translation unit for dependencies.
     pub fn scan_file(&self, source: &Path) -> Result<ScanResult, std::io::Error> {
+        let dep_options = depgraph::DepCollectOptions {
+            missing_as_generated: self.options.missing_as_generated,
+            trigraphs: self.options.trigraphs,
+        };
         let deps = depgraph::collect_deps(
             source,
             &self.options.search_paths,
             &self.cache,
             &self.options.defines,
+            &dep_options,
         )?;
 
         // Build effective output options
