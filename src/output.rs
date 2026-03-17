@@ -172,14 +172,14 @@ fn escape_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn dep(path: &str) -> DepEntry {
-        DepEntry { path: PathBuf::from(path), is_system: false }
+        DepEntry { path: Arc::from(Path::new(path)), is_system: false }
     }
 
     fn sys_dep(path: &str) -> DepEntry {
-        DepEntry { path: PathBuf::from(path), is_system: true }
+        DepEntry { path: Arc::from(Path::new(path)), is_system: true }
     }
 
     #[test]

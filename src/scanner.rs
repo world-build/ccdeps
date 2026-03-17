@@ -144,11 +144,19 @@ impl Scanner {
     ///
     /// Uses Rayon's work-stealing thread pool. The file cache is shared
     /// across all threads, so common headers are only read and minimized once.
+    ///
+    /// For single-file inputs, skips Rayon's thread pool entirely to avoid
+    /// the ~0.5ms overhead of work-stealing setup.
     pub fn scan_files(&self, sources: &[PathBuf]) -> Vec<Result<ScanResult, std::io::Error>> {
-        sources
-            .par_iter()
-            .map(|source| self.scan_file(source))
-            .collect()
+        if sources.len() <= 1 {
+            // Single-file fast path: skip thread pool overhead
+            sources.iter().map(|source| self.scan_file(source)).collect()
+        } else {
+            sources
+                .par_iter()
+                .map(|source| self.scan_file(source))
+                .collect()
+        }
     }
 }
 

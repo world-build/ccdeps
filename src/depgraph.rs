@@ -13,9 +13,15 @@ use std::sync::Arc;
 
 use crate::directive::{self, Directive, IncludeStyle};
 use crate::eval;
+use crate::intern::PathInterner;
 use crate::macros::MacroTable;
 use crate::minimize;
 use crate::resolve::{ResolvedInclude, SearchPaths};
+
+/// Files at or above this size use memory-mapped I/O. Below this threshold,
+/// a plain `read` is faster because mmap has fixed per-call overhead (~2 µs
+/// for the VMA setup + page fault) that dominates for tiny files.
+const MMAP_THRESHOLD: u64 = 4096;
 
 /// Cached information about a scanned file.
 #[derive(Debug)]
@@ -29,8 +35,8 @@ pub struct FileInfo {
 /// A dependency entry with metadata about how it was resolved.
 #[derive(Debug, Clone)]
 pub struct DepEntry {
-    /// The canonical file path.
-    pub path: PathBuf,
+    /// The canonical file path (interned to avoid redundant allocations).
+    pub path: Arc<Path>,
     /// Whether this dependency was found via a system include path (`-isystem`).
     pub is_system: bool,
 }
@@ -56,6 +62,7 @@ pub fn collect_deps(
     let mut deps = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut macros = MacroTable::new();
+    let interner = PathInterner::new();
 
     // Apply command-line defines
     for (name, value) in initial_defines {
@@ -72,6 +79,7 @@ pub fn collect_deps(
         &mut deps,
         &mut visited,
         &mut macros,
+        &interner,
     )?;
 
     Ok(deps)
@@ -151,6 +159,7 @@ fn collect_deps_recursive(
     deps: &mut Vec<DepEntry>,
     visited: &mut std::collections::HashSet<PathBuf>,
     macros: &mut MacroTable,
+    interner: &PathInterner,
 ) -> Result<(), std::io::Error> {
     let info = get_or_scan(file_path, cache)?;
 
@@ -293,15 +302,17 @@ fn collect_deps_recursive(
                         };
 
                         if dominated {
-                            if !deps.iter().any(|d| d.path == canonical) {
-                                deps.push(DepEntry { path: canonical, is_system });
+                            let interned = interner.intern(&canonical);
+                            if !deps.iter().any(|d| *d.path == *interned) {
+                                deps.push(DepEntry { path: interned, is_system });
                             }
                             continue;
                         }
                     }
 
                     visited.insert(canonical.clone());
-                    deps.push(DepEntry { path: canonical.clone(), is_system });
+                    let interned = interner.intern_owned(canonical.clone());
+                    deps.push(DepEntry { path: interned, is_system });
 
                     collect_deps_recursive(
                         &canonical,
@@ -310,6 +321,7 @@ fn collect_deps_recursive(
                         deps,
                         visited,
                         macros,
+                        interner,
                     )?;
                 }
             }
@@ -334,18 +346,44 @@ fn extract_include_path(expanded: &str) -> Option<String> {
 }
 
 /// Get file info from cache, or scan and cache it.
+///
+/// Uses memory-mapped I/O for files >= 4 KB (avoids the allocation + copy of
+/// `std::fs::read`) and plain `read` for smaller files (avoids mmap's fixed
+/// VMA setup overhead).
 fn get_or_scan(path: &Path, cache: &FileCache) -> Result<Arc<FileInfo>, std::io::Error> {
     if let Some(info) = cache.get(path) {
         return Ok(Arc::clone(&info));
     }
 
-    let source = std::fs::read(path)?;
-    let original_size = source.len();
-    let minimized = minimize::minimize(&source);
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_size = metadata.len();
+
+    let minimized = if file_size >= MMAP_THRESHOLD {
+        // Large file: memory-map for zero-copy access.
+        // SAFETY: We hold the file open for the duration of the mmap, and the
+        // minimizer only reads the mapped region. Concurrent modification by
+        // another process would be a pre-existing build-system bug.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+        // Hint to the kernel that we'll read sequentially.
+        #[cfg(unix)]
+        {
+            mmap.advise(memmap2::Advice::Sequential).ok();
+        }
+
+        let result = minimize::minimize(&mmap);
+        // mmap is dropped here, unmapping the region
+        result
+    } else {
+        // Small file: plain read is faster than mmap overhead.
+        let source = std::fs::read(path)?;
+        minimize::minimize(&source)
+    };
 
     let info = Arc::new(FileInfo {
         minimized,
-        original_size,
+        original_size: file_size as usize,
     });
 
     cache.insert(path.to_path_buf(), Arc::clone(&info));

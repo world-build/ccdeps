@@ -25,8 +25,9 @@ pub struct MinimizedSource {
 /// Minimize a source file, keeping only preprocessor directive lines.
 ///
 /// The minimizer scans for lines beginning with `#` (after optional whitespace)
-/// and preserves those lines. It also tracks string literals and comments to
-/// avoid false positives from `#` characters inside them.
+/// and preserves those lines. It skips over string literals, character literals,
+/// and comments (both `//` and `/* */`) so that `#` characters inside them are
+/// never mistaken for directives.
 pub fn minimize(source: &[u8]) -> MinimizedSource {
     let mut result = MinimizedSource {
         content: Vec::with_capacity(source.len() / 4),
@@ -41,11 +42,39 @@ pub fn minimize(source: &[u8]) -> MinimizedSource {
     let mut directive_count = 0;
 
     while pos < source.len() {
-        // Find the next '#' character using SIMD-accelerated search
-        let hash_pos = match memchr(b'#', &source[pos..]) {
-            Some(offset) => pos + offset,
-            None => break,
-        };
+        let b = source[pos];
+
+        // Skip block comments: /* ... */
+        if b == b'/' && pos + 1 < source.len() && source[pos + 1] == b'*' {
+            pos = skip_block_comment(source, pos + 2);
+            continue;
+        }
+
+        // Skip line comments: // ...
+        if b == b'/' && pos + 1 < source.len() && source[pos + 1] == b'/' {
+            pos = skip_to_eol(source, pos + 2);
+            continue;
+        }
+
+        // Skip string literals: "..."
+        if b == b'"' {
+            pos = skip_string_literal(source, pos + 1, b'"');
+            continue;
+        }
+
+        // Skip character literals: '...'
+        if b == b'\'' {
+            pos = skip_string_literal(source, pos + 1, b'\'');
+            continue;
+        }
+
+        // Look for '#' at the start of a line
+        if b != b'#' {
+            pos += 1;
+            continue;
+        }
+
+        let hash_pos = pos;
 
         // Check that '#' is at the start of a line (only whitespace before it)
         let line_start = find_line_start(source, hash_pos);
@@ -93,6 +122,49 @@ pub fn minimize(source: &[u8]) -> MinimizedSource {
     }
 
     result
+}
+
+/// Skip past a `/* ... */` block comment. `pos` points just past the `/*`.
+#[inline]
+fn skip_block_comment(source: &[u8], mut pos: usize) -> usize {
+    while pos + 1 < source.len() {
+        if source[pos] == b'*' && source[pos + 1] == b'/' {
+            return pos + 2;
+        }
+        pos += 1;
+    }
+    source.len()
+}
+
+/// Skip to end of line (or end of source).
+#[inline]
+fn skip_to_eol(source: &[u8], pos: usize) -> usize {
+    match memchr(b'\n', &source[pos..]) {
+        Some(offset) => pos + offset + 1,
+        None => source.len(),
+    }
+}
+
+/// Skip past a string or character literal. `pos` points just past the opening
+/// quote. Handles backslash escapes.
+#[inline]
+fn skip_string_literal(source: &[u8], mut pos: usize, quote: u8) -> usize {
+    while pos < source.len() {
+        let b = source[pos];
+        if b == quote {
+            return pos + 1;
+        }
+        if b == b'\\' && pos + 1 < source.len() {
+            pos += 2; // skip escaped char
+            continue;
+        }
+        if b == b'\n' {
+            // Unterminated literal — stop here to avoid consuming directives
+            return pos;
+        }
+        pos += 1;
+    }
+    source.len()
 }
 
 /// Find the start of the line containing `pos`.
