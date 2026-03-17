@@ -68,8 +68,12 @@ pub fn parse_directive(line: &str) -> Option<Directive<'_>> {
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(rest.len());
         let name = &rest[..name_end];
+        // Preserve whether `(` immediately follows the name (function-like)
+        // vs space-then-`(` (object-like). Only trim trailing whitespace.
         let value = if name_end < rest.len() {
-            Some(rest[name_end..].trim())
+            let raw = &rest[name_end..];
+            let trimmed = raw.trim_end();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
         } else {
             None
         };
@@ -200,7 +204,7 @@ mod tests {
     #[test]
     fn test_define() {
         let d = parse_directive("#define FOO 42").unwrap();
-        assert!(matches!(d, Directive::Define { name: "FOO", value: Some("42") }));
+        assert!(matches!(d, Directive::Define { name: "FOO", value: Some(" 42") }));
     }
 
     #[test]

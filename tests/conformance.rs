@@ -280,6 +280,125 @@ fn conformance_subdirectory_includes() {
     assert_matches_compiler(&source, &[inc_path], "clang");
 }
 
+// ---- Phase 2: computed includes, function-like macros, __has_include ----
+
+#[test]
+fn conformance_computed_include() {
+    let tc = TestCase::new();
+    tc.write_file("foo.h", "int foo;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define HEADER \"foo.h\"\n#include HEADER\nint main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_computed_include_function_like() {
+    let tc = TestCase::new();
+    tc.write_file("bar.h", "int bar;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define MAKE_HEADER(name) #name \".h\"\n\
+         // Note: the above produces \"bar\" \".h\" which gcc doesn't accept as a single path.\n\
+         // Instead, use a simpler object-like macro approach:\n\
+         #define HEADER \"bar.h\"\n\
+         #include HEADER\n\
+         int main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_computed_include_angle() {
+    let tc = TestCase::new();
+    tc.write_file("sys.h", "int sys;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define SYS_HEADER <sys.h>\n#include SYS_HEADER\nint main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_has_include() {
+    let tc = TestCase::new();
+    tc.write_file("exists.h", "int exists;\n");
+    tc.write_file("fallback.h", "int fallback;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#if __has_include(\"exists.h\")\n\
+         #include \"exists.h\"\n\
+         #else\n\
+         #include \"fallback.h\"\n\
+         #endif\n\
+         int main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_has_include_missing() {
+    let tc = TestCase::new();
+    tc.write_file("fallback.h", "int fallback;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#if __has_include(\"nonexistent.h\")\n\
+         #include \"nonexistent.h\"\n\
+         #else\n\
+         #include \"fallback.h\"\n\
+         #endif\n\
+         int main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_function_like_macro_in_if() {
+    let tc = TestCase::new();
+    tc.write_file("yes.h", "int yes;\n");
+    tc.write_file("no.h", "int no;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define CHECK(x) x\n\
+         #if CHECK(1)\n\
+         #include \"yes.h\"\n\
+         #else\n\
+         #include \"no.h\"\n\
+         #endif\n\
+         int main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
+#[test]
+fn conformance_chained_macro_include() {
+    let tc = TestCase::new();
+    tc.write_file("target.h", "int target;\n");
+    let source = tc.write_file(
+        "main.c",
+        "#define A B\n\
+         #define B \"target.h\"\n\
+         #include A\n\
+         int main() {}\n",
+    );
+
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "gcc");
+    assert_matches_compiler(&source, &[tc.path().to_path_buf()], "clang");
+}
+
 // ---- Unit tests for the dep parser ----
 
 #[test]

@@ -5,23 +5,128 @@
 //!
 //! Follows GCC's `expr.cc` (lines 1454-1810) operator-precedence structure.
 
+use std::path::Path;
+
 use crate::macros::MacroTable;
+use crate::resolve::SearchPaths;
+
+/// Context for evaluating `__has_include` in `#if` expressions.
+pub struct EvalContext<'a> {
+    pub search_paths: &'a SearchPaths,
+    pub current_file_dir: &'a Path,
+}
 
 /// Evaluate a `#if` expression string to an `i64`.
 ///
 /// Undefined identifiers evaluate to `0` (per C standard).
 /// `defined(X)` checks the macro table without expanding X.
-pub fn evaluate(expr: &str, macros: &MacroTable) -> i64 {
-    eval_inner(expr, macros, 0)
+/// Function-like macros are expanded before evaluation.
+pub fn evaluate(expr: &str, macros: &mut MacroTable) -> i64 {
+    eval_inner(expr, macros, 0, None)
 }
 
-fn eval_inner(expr: &str, macros: &MacroTable, depth: u32) -> i64 {
+/// Evaluate a `#if` expression with context for `__has_include`.
+pub fn evaluate_with_context(expr: &str, macros: &mut MacroTable, ctx: &EvalContext<'_>) -> i64 {
+    eval_inner(expr, macros, 0, Some(ctx))
+}
+
+fn eval_inner(expr: &str, macros: &mut MacroTable, depth: u32, ctx: Option<&EvalContext<'_>>) -> i64 {
     let expr = expr.trim();
     if expr.is_empty() || depth > 64 {
         return 0;
     }
-    let mut p = Parser::new(expr, macros, depth);
+    // Evaluate __has_include expressions first (before macro expansion)
+    let expr_str = resolve_has_include(expr, ctx);
+    let expr_ref = expr_str.as_deref().unwrap_or(expr);
+    // Expand macros (including function-like) before evaluating
+    let expanded = macros.expand(expr_ref);
+    let expanded = expanded.trim();
+    // If nothing changed and it's a simple re-entrant case, evaluate directly
+    if expanded == expr_ref {
+        let mut p = Parser::new(expr_ref, macros);
+        return p.parse_expr(0);
+    }
+    // Re-evaluate the expanded form (may contain further __has_include after expansion)
+    let expanded2 = resolve_has_include(expanded, ctx);
+    let final_expr = expanded2.as_deref().unwrap_or(expanded);
+    let mut p = Parser::new(final_expr, macros);
     p.parse_expr(0)
+}
+
+/// Find and replace `__has_include("path")` / `__has_include(<path>)` with `0` or `1`.
+fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>) -> Option<String> {
+    if !expr.contains("__has_include") {
+        return None;
+    }
+
+    let mut result = String::with_capacity(expr.len());
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < bytes.len() {
+        // Look for __has_include or __has_include_next
+        if i + 15 <= bytes.len() && expr[i..].starts_with("__has_include") {
+            let keyword_end = if expr[i..].starts_with("__has_include_next") {
+                i + 18
+            } else {
+                i + 13
+            };
+            let mut j = keyword_end;
+            // Skip whitespace
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                j += 1;
+                // Skip whitespace
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                // Parse "path" or <path>
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'<') {
+                    let delim = bytes[j];
+                    let close_delim = if delim == b'"' { b'"' } else { b'>' };
+                    j += 1;
+                    let path_start = j;
+                    while j < bytes.len() && bytes[j] != close_delim {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        let path = &expr[path_start..j];
+                        j += 1; // skip close delimiter
+                        // Skip whitespace and closing paren
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < bytes.len() && bytes[j] == b')' {
+                            j += 1;
+                            // Resolve the include
+                            let found = if let Some(ctx) = ctx {
+                                if delim == b'<' {
+                                    ctx.search_paths.resolve_angle(path).is_some()
+                                } else {
+                                    ctx.search_paths
+                                        .resolve_quoted(path, ctx.current_file_dir)
+                                        .is_some()
+                                }
+                            } else {
+                                false
+                            };
+                            result.push_str(if found { "1" } else { "0" });
+                            i = j;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    if changed { Some(result) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,18 +442,16 @@ struct Parser<'a> {
     lexer: Lexer<'a>,
     token: Token<'a>,
     macros: &'a MacroTable,
-    depth: u32,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, macros: &'a MacroTable, depth: u32) -> Self {
+    fn new(input: &'a str, macros: &'a MacroTable) -> Self {
         let mut lexer = Lexer::new(input);
         let token = lexer.next();
         Self {
             lexer,
             token,
             macros,
-            depth,
         }
     }
 
@@ -370,10 +473,8 @@ impl<'a> Parser<'a> {
 
                 if name == "defined" {
                     self.parse_defined()
-                } else if let Some(value) = self.macros.get(name) {
-                    eval_inner(value, self.macros, self.depth + 1)
                 } else {
-                    // Undefined identifier → 0 (per C standard)
+                    // After macro expansion, remaining identifiers are undefined → 0 (per C standard)
                     0
                 }
             }
@@ -484,6 +585,7 @@ impl<'a> Parser<'a> {
 
         result
     }
+
 }
 
 fn apply_binop(op: Token<'_>, lhs: i64, rhs: i64) -> i64 {
@@ -527,10 +629,10 @@ mod tests {
     use super::*;
 
     fn eval(expr: &str) -> i64 {
-        evaluate(expr, &MacroTable::new())
+        evaluate(expr, &mut MacroTable::new())
     }
 
-    fn eval_with(expr: &str, macros: &MacroTable) -> i64 {
+    fn eval_with(expr: &str, macros: &mut MacroTable) -> i64 {
         evaluate(expr, macros)
     }
 
@@ -677,16 +779,16 @@ mod tests {
     fn test_defined_paren() {
         let mut m = MacroTable::new();
         m.define("FOO", Some("1"));
-        assert_eq!(eval_with("defined(FOO)", &m), 1);
-        assert_eq!(eval_with("defined(BAR)", &m), 0);
+        assert_eq!(eval_with("defined(FOO)", &mut m), 1);
+        assert_eq!(eval_with("defined(BAR)", &mut m), 0);
     }
 
     #[test]
     fn test_defined_no_paren() {
         let mut m = MacroTable::new();
         m.define("FOO", None);
-        assert_eq!(eval_with("defined FOO", &m), 1);
-        assert_eq!(eval_with("defined BAR", &m), 0);
+        assert_eq!(eval_with("defined FOO", &mut m), 1);
+        assert_eq!(eval_with("defined BAR", &mut m), 0);
     }
 
     // Macro expansion
@@ -694,8 +796,8 @@ mod tests {
     fn test_macro_expansion() {
         let mut m = MacroTable::new();
         m.define("VERSION", Some("3"));
-        assert_eq!(eval_with("VERSION > 2", &m), 1);
-        assert_eq!(eval_with("VERSION == 3", &m), 1);
+        assert_eq!(eval_with("VERSION > 2", &mut m), 1);
+        assert_eq!(eval_with("VERSION == 3", &mut m), 1);
     }
 
     #[test]
@@ -703,7 +805,7 @@ mod tests {
         let mut m = MacroTable::new();
         m.define("A", Some("B"));
         m.define("B", Some("42"));
-        assert_eq!(eval_with("A", &m), 42);
+        assert_eq!(eval_with("A", &mut m), 42);
     }
 
     #[test]
@@ -717,14 +819,14 @@ mod tests {
         let mut m = MacroTable::new();
         m.define("MAJOR", Some("3"));
         m.define("MINOR", Some("14"));
-        assert_eq!(eval_with("MAJOR * 100 + MINOR >= 300", &m), 1);
+        assert_eq!(eval_with("MAJOR * 100 + MINOR >= 300", &mut m), 1);
     }
 
     #[test]
     fn test_defined_and_value() {
         let mut m = MacroTable::new();
         m.define("USE_FOO", Some("1"));
-        assert_eq!(eval_with("defined(USE_FOO) && USE_FOO", &m), 1);
+        assert_eq!(eval_with("defined(USE_FOO) && USE_FOO", &mut m), 1);
     }
 
     #[test]
@@ -735,5 +837,96 @@ mod tests {
     #[test]
     fn test_wide_char() {
         assert_eq!(eval("L'A'"), 65);
+    }
+
+    // Function-like macros in #if
+    #[test]
+    fn test_function_like_macro_in_if() {
+        let mut m = MacroTable::new();
+        m.define_function_like("CHECK", "(x) x");
+        assert_eq!(eval_with("CHECK(1)", &mut m), 1);
+        assert_eq!(eval_with("CHECK(0)", &mut m), 0);
+    }
+
+    #[test]
+    fn test_function_like_macro_complex() {
+        let mut m = MacroTable::new();
+        m.define_function_like("VER", "(maj, min) maj * 100 + min");
+        assert_eq!(eval_with("VER(3, 14) >= 300", &mut m), 1);
+    }
+
+    // __has_include
+    #[test]
+    fn test_has_include_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("exists.h"), "").unwrap();
+
+        let search_paths = crate::resolve::SearchPaths::default();
+        let ctx = EvalContext {
+            search_paths: &search_paths,
+            current_file_dir: dir.path(),
+        };
+        let mut m = MacroTable::new();
+        assert_eq!(
+            evaluate_with_context("__has_include(\"exists.h\")", &mut m, &ctx),
+            1
+        );
+        assert_eq!(
+            evaluate_with_context("__has_include(\"nonexistent.h\")", &mut m, &ctx),
+            0
+        );
+    }
+
+    #[test]
+    fn test_has_include_angle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sys.h"), "").unwrap();
+
+        let search_paths = crate::resolve::SearchPaths {
+            include_paths: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let ctx = EvalContext {
+            search_paths: &search_paths,
+            current_file_dir: dir.path(),
+        };
+        let mut m = MacroTable::new();
+        assert_eq!(
+            evaluate_with_context("__has_include(<sys.h>)", &mut m, &ctx),
+            1
+        );
+        assert_eq!(
+            evaluate_with_context("__has_include(<missing.h>)", &mut m, &ctx),
+            0
+        );
+    }
+
+    #[test]
+    fn test_has_include_in_expression() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("opt.h"), "").unwrap();
+
+        let search_paths = crate::resolve::SearchPaths::default();
+        let ctx = EvalContext {
+            search_paths: &search_paths,
+            current_file_dir: dir.path(),
+        };
+        let mut m = MacroTable::new();
+        assert_eq!(
+            evaluate_with_context(
+                "__has_include(\"opt.h\") && 1",
+                &mut m,
+                &ctx,
+            ),
+            1
+        );
+        assert_eq!(
+            evaluate_with_context(
+                "__has_include(\"nope.h\") || 0",
+                &mut m,
+                &ctx,
+            ),
+            0
+        );
     }
 }

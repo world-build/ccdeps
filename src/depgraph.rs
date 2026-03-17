@@ -147,6 +147,11 @@ fn collect_deps_recursive(
 
     let content = String::from_utf8_lossy(&info.minimized.content);
     let mut cond_stack = ConditionalStack::new();
+    let current_dir = file_path.parent().unwrap_or(Path::new("."));
+    let eval_ctx = eval::EvalContext {
+        search_paths,
+        current_file_dir: current_dir,
+    };
 
     for line in content.lines() {
         let line = line.trim();
@@ -164,7 +169,7 @@ fn collect_deps_recursive(
         match directive {
             Directive::If { expr } => {
                 let condition = if cond_stack.is_active() {
-                    eval::evaluate(expr, macros) != 0
+                    eval::evaluate_with_context(expr, macros, &eval_ctx) != 0
                 } else {
                     false
                 };
@@ -190,7 +195,7 @@ fn collect_deps_recursive(
                 continue;
             }
             Directive::Elif { expr } => {
-                let condition = eval::evaluate(expr, macros) != 0;
+                let condition = eval::evaluate_with_context(expr, macros, &eval_ctx) != 0;
                 cond_stack.handle_elif(condition);
                 continue;
             }
@@ -212,7 +217,18 @@ fn collect_deps_recursive(
 
         match directive {
             Directive::Define { name, value } => {
-                macros.define(name, value);
+                // Detect function-like macros: value starts with '(' immediately
+                // after the name (no space). `#define FOO(x) x+1` → value="(x) x+1"
+                // `#define FOO (x)` → value=" (x)" (space = object-like)
+                if let Some(val) = value {
+                    if val.starts_with('(') {
+                        macros.define_function_like(name, val);
+                    } else {
+                        macros.define(name, Some(val.trim_start()));
+                    }
+                } else {
+                    macros.define(name, None);
+                }
             }
             Directive::Undef { name } => {
                 macros.undef(name);
@@ -225,8 +241,20 @@ fn collect_deps_recursive(
                     }
                     IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
                     IncludeStyle::Computed => {
-                        // Cannot resolve computed includes without full macro expansion (Phase 2)
-                        continue;
+                        // Macro-expand the tokens and re-parse as "path" or <path>
+                        let expanded = macros.expand(inc.path);
+                        let expanded = expanded.trim();
+                        if let Some(path) = extract_include_path(expanded) {
+                            let is_angle = expanded.starts_with('<');
+                            if is_angle {
+                                search_paths.resolve_angle(&path)
+                            } else {
+                                let dir = file_path.parent().unwrap_or(Path::new("."));
+                                search_paths.resolve_quoted(&path, dir)
+                            }
+                        } else {
+                            continue;
+                        }
                     }
                 };
 
@@ -281,6 +309,19 @@ fn collect_deps_recursive(
     }
 
     Ok(())
+}
+
+/// Extract the path from an expanded include token sequence.
+/// Handles `"path"` and `<path>` forms.
+fn extract_include_path(expanded: &str) -> Option<String> {
+    let s = expanded.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        Some(s[1..s.len() - 1].to_string())
+    } else if s.starts_with('<') && s.ends_with('>') && s.len() >= 2 {
+        Some(s[1..s.len() - 1].to_string())
+    } else {
+        None
+    }
 }
 
 /// Get file info from cache, or scan and cache it.
@@ -537,5 +578,101 @@ mod tests {
             .collect();
         assert!(names.contains(&"config.h".to_string()));
         assert!(names.contains(&"feature.h".to_string()));
+    }
+
+    #[test]
+    fn test_computed_include() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("target.h"), "// target\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#define HEADER \"target.h\"\n#include HEADER\n",
+        )
+        .unwrap();
+
+        let search_paths = SearchPaths::default();
+        let cache = new_file_cache();
+
+        let deps =
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+        let names: Vec<_> = deps
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"target.h".to_string()));
+    }
+
+    #[test]
+    fn test_computed_include_chained() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("real.h"), "// real\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#define A B\n#define B \"real.h\"\n#include A\n",
+        )
+        .unwrap();
+
+        let search_paths = SearchPaths::default();
+        let cache = new_file_cache();
+
+        let deps =
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+        let names: Vec<_> = deps
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"real.h".to_string()));
+    }
+
+    #[test]
+    fn test_function_like_define_in_if() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
+        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#define CHECK(x) x\n#if CHECK(1)\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        let search_paths = SearchPaths::default();
+        let cache = new_file_cache();
+
+        let deps =
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+        let names: Vec<_> = deps
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"yes.h".to_string()));
+        assert!(!names.contains(&"no.h".to_string()));
+    }
+
+    #[test]
+    fn test_has_include_directive() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(dir.path().join("exists.h"), "// exists\n").unwrap();
+        fs::write(dir.path().join("fallback.h"), "// fallback\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#if __has_include(\"exists.h\")\n#include \"exists.h\"\n#else\n#include \"fallback.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        let search_paths = SearchPaths::default();
+        let cache = new_file_cache();
+
+        let deps =
+            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[]).unwrap();
+        let names: Vec<_> = deps
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"exists.h".to_string()));
+        assert!(!names.contains(&"fallback.h".to_string()));
     }
 }
