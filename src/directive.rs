@@ -11,6 +11,8 @@ pub enum Directive<'a> {
     IncludeNext(IncludeDirective<'a>),
     /// `#import "path"` or `#import <path>` (Objective-C, once-only semantics)
     Import(IncludeDirective<'a>),
+    /// `#embed "path"` or `#embed <path>` (C23, binary resource embedding)
+    Embed(IncludeDirective<'a>),
     /// `#define MACRO ...`
     Define { name: &'a str, value: Option<&'a str> },
     /// `#undef MACRO`
@@ -71,6 +73,9 @@ pub fn parse_directive(line: &str) -> Option<Directive<'_>> {
     }
     if let Some(rest) = strip_keyword(after_hash, "import") {
         return Some(parse_import(rest));
+    }
+    if let Some(rest) = strip_keyword(after_hash, "embed") {
+        return Some(parse_embed(rest));
     }
     if let Some(rest) = strip_keyword(after_hash, "define") {
         let rest = rest.trim_start();
@@ -149,6 +154,10 @@ fn parse_include_next(rest: &str) -> Directive<'_> {
 
 fn parse_import(rest: &str) -> Directive<'_> {
     Directive::Import(parse_include_path(rest))
+}
+
+fn parse_embed(rest: &str) -> Directive<'_> {
+    Directive::Embed(parse_include_path(rest))
 }
 
 fn parse_include_path(rest: &str) -> IncludeDirective<'_> {

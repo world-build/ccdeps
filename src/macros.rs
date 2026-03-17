@@ -357,13 +357,21 @@ impl MacroTable {
                         }
                         if i < bytes.len() && bytes[i] == b'(' {
                             i += 1; // skip '('
-                            let args = parse_macro_args(input, &mut i);
+                            let raw_args = parse_macro_args(input, &mut i);
                             let params = params.clone();
                             let variadic_name = variadic_name.clone();
                             let body = body.clone();
+                            // Per C standard: arguments are fully expanded before
+                            // substitution, UNLESS the parameter is used with # or ##.
+                            // We pre-expand all args; substitute_args uses raw_args
+                            // for # and ## contexts, expanded_args for normal substitution.
+                            let expanded_args: Vec<String> = raw_args
+                                .iter()
+                                .map(|a| self.expand_inner(a, disabled, depth + 1))
+                                .collect();
                             let expanded = substitute_args(
-                                &body, &params, &args, is_variadic,
-                                variadic_name.as_deref(),
+                                &body, &params, &raw_args, &expanded_args,
+                                is_variadic, variadic_name.as_deref(),
                             );
                             disabled.insert(ident.to_string());
                             let re_expanded =
@@ -478,10 +486,14 @@ fn parse_macro_args(input: &str, pos: &mut usize) -> Vec<String> {
 
 /// Substitute macro arguments into a function-like macro body.
 /// Handles `#` (stringification) and `##` (token pasting).
+///
+/// `raw_args` are the original, unexpanded arguments (used for `#` and `##`).
+/// `expanded_args` are the fully macro-expanded arguments (used for normal substitution).
 fn substitute_args(
     body: &str,
     params: &[String],
-    args: &[String],
+    raw_args: &[String],
+    expanded_args: &[String],
     is_variadic: bool,
     variadic_name: Option<&str>,
 ) -> String {
@@ -490,7 +502,7 @@ fn substitute_args(
     let mut i = 0;
 
     while i < bytes.len() {
-        // ## token pasting
+        // ## token pasting — uses RAW (unexpanded) args
         if i + 1 < bytes.len() && bytes[i] == b'#' && bytes[i + 1] == b'#' {
             // Trim trailing whitespace from result
             let trimmed_len = result.trim_end().len();
@@ -511,7 +523,7 @@ fn substitute_args(
                     i += 1;
                 }
                 let token = &body[start..i];
-                if let Some(arg_val) = lookup_param(token, params, args, is_variadic, variadic_name) {
+                if let Some(arg_val) = lookup_param(token, params, raw_args, is_variadic, variadic_name) {
                     result.push_str(&arg_val);
                 } else {
                     result.push_str(token);
@@ -520,7 +532,7 @@ fn substitute_args(
             continue;
         }
 
-        // # stringification
+        // # stringification — uses RAW (unexpanded) args
         if bytes[i] == b'#' {
             i += 1;
             // Skip whitespace
@@ -537,7 +549,7 @@ fn substitute_args(
                     i += 1;
                 }
                 let token = &body[start..i];
-                if let Some(arg_val) = lookup_param(token, params, args, is_variadic, variadic_name) {
+                if let Some(arg_val) = lookup_param(token, params, raw_args, is_variadic, variadic_name) {
                     result.push('"');
                     for ch in arg_val.chars() {
                         if ch == '"' || ch == '\\' {
@@ -556,7 +568,7 @@ fn substitute_args(
             continue;
         }
 
-        // Identifier — check if it's a parameter
+        // Identifier — check if it's a parameter. Uses EXPANDED args.
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
             while i < bytes.len()
@@ -565,7 +577,7 @@ fn substitute_args(
                 i += 1;
             }
             let token = &body[start..i];
-            if let Some(arg_val) = lookup_param(token, params, args, is_variadic, variadic_name) {
+            if let Some(arg_val) = lookup_param(token, params, expanded_args, is_variadic, variadic_name) {
                 result.push_str(&arg_val);
             } else {
                 result.push_str(token);
@@ -769,6 +781,17 @@ mod tests {
         t.define("HEADER", Some("\"foo.h\""));
         let result = t.expand("HEADER");
         assert_eq!(result, "\"foo.h\"");
+    }
+
+    #[test]
+    fn test_stringize_for_include() {
+        let mut t = MacroTable::new();
+        t.define_function_like("STRINGIZE", "(text) STRINGIZE_I(text)");
+        t.define_function_like("STRINGIZE_I", "(text) #text");
+        t.define("INC", Some("pp-record.h"));
+        let result = t.expand("STRINGIZE(INC)");
+        // Should produce "pp-record.h" (a string literal containing the filename)
+        assert_eq!(result, "\"pp-record.h\"", "stringize chain should produce quoted string");
     }
 
     #[test]

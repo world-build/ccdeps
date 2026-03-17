@@ -35,8 +35,11 @@ pub struct FileInfo {
 /// A dependency entry with metadata about how it was resolved.
 #[derive(Debug, Clone)]
 pub struct DepEntry {
-    /// The canonical file path (interned to avoid redundant allocations).
+    /// The canonical file path (interned, used for deduplication).
     pub path: Arc<Path>,
+    /// The path to display in output (preserves `../` and `./` as gcc does).
+    /// If `None`, `path` is used for display.
+    pub display_path: Option<PathBuf>,
     /// Whether this dependency was found via a system include path (`-isystem`).
     pub is_system: bool,
 }
@@ -98,6 +101,7 @@ pub fn collect_deps(
         options,
         &minimize_opts,
         false, // is_system_header
+        None,  // display_dir (root file has no display override)
     )?;
 
     Ok(deps)
@@ -182,6 +186,7 @@ fn collect_deps_recursive(
     options: &DepCollectOptions,
     minimize_opts: &MinimizeOptions,
     mut is_system_header: bool,
+    display_dir: Option<&Path>,
 ) -> Result<(), std::io::Error> {
     let info = get_or_scan(file_path, cache, minimize_opts)?;
 
@@ -287,6 +292,7 @@ fn collect_deps_recursive(
                     inc, file_path, search_paths, cache, deps, visited, macros,
                     interner, import_once, options, minimize_opts, is_system_header,
                     false, // is_import
+                    display_dir,
                 )?;
             }
             Directive::IncludeNext(ref inc) => {
@@ -295,9 +301,9 @@ fn collect_deps_recursive(
                     inc.path,
                     current_dir,
                 );
-                if let Some(ResolvedInclude { path: resolved_path, is_system }) = resolved {
+                if let Some(ResolvedInclude { path: resolved_path, is_system, display_path }) = resolved {
                     process_resolved_include(
-                        &resolved_path, is_system || is_system_header,
+                        &resolved_path, is_system || is_system_header, display_path,
                         search_paths, cache, deps, visited, macros,
                         interner, import_once, options, minimize_opts, false,
                     )?;
@@ -310,7 +316,57 @@ fn collect_deps_recursive(
                     inc, file_path, search_paths, cache, deps, visited, macros,
                     interner, import_once, options, minimize_opts, is_system_header,
                     true, // is_import
+                    display_dir,
                 )?;
+            }
+            Directive::Embed(ref inc) => {
+                // #embed is like #include for dependency purposes — resolve and add
+                // to deps, but don't recurse (it embeds binary data, not source).
+                let resolved = match inc.style {
+                    IncludeStyle::Quoted => {
+                        let dir = file_path.parent().unwrap_or(Path::new("."));
+                        search_paths.resolve_quoted(inc.path, dir, display_dir)
+                    }
+                    IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
+                    IncludeStyle::Computed => {
+                        let expanded = macros.expand(inc.path);
+                        let expanded = expanded.trim().to_string();
+                        if let Some(path) = extract_include_path(&expanded) {
+                            let is_angle = expanded.starts_with('<');
+                            if is_angle {
+                                search_paths.resolve_angle(&path)
+                            } else {
+                                let dir = file_path.parent().unwrap_or(Path::new("."));
+                                search_paths.resolve_quoted(&path, dir, display_dir)
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(ResolvedInclude { path: resolved_path, is_system, display_path: res_display }) = resolved {
+                    let canonical = match std::fs::canonicalize(&resolved_path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let display_path = res_display.or_else(|| {
+                        if resolved_path != canonical {
+                            Some(resolved_path)
+                        } else {
+                            None
+                        }
+                    });
+                    let interned_path = interner.intern(&canonical);
+                    if !deps.iter().any(|d| *d.path == *interned_path) {
+                        deps.push(DepEntry {
+                            path: interned_path,
+                            display_path,
+                            is_system: is_system || is_system_header,
+                        });
+                    }
+                } else if options.missing_as_generated {
+                    add_missing_dep(inc.path, deps, interner);
+                }
             }
             _ => {}
         }
@@ -370,11 +426,12 @@ fn handle_include(
     minimize_opts: &MinimizeOptions,
     is_system_header: bool,
     is_import: bool,
+    display_dir: Option<&Path>,
 ) -> Result<(), std::io::Error> {
     let resolved = match inc.style {
         IncludeStyle::Quoted => {
             let dir = file_path.parent().unwrap_or(Path::new("."));
-            search_paths.resolve_quoted(inc.path, dir)
+            search_paths.resolve_quoted(inc.path, dir, display_dir)
         }
         IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
         IncludeStyle::Computed => {
@@ -386,7 +443,7 @@ fn handle_include(
                     search_paths.resolve_angle(&path)
                 } else {
                     let dir = file_path.parent().unwrap_or(Path::new("."));
-                    search_paths.resolve_quoted(&path, dir)
+                    search_paths.resolve_quoted(&path, dir, display_dir)
                 }
             } else {
                 return Ok(());
@@ -394,9 +451,9 @@ fn handle_include(
         }
     };
 
-    if let Some(ResolvedInclude { path: resolved_path, is_system }) = resolved {
+    if let Some(ResolvedInclude { path: resolved_path, is_system, display_path }) = resolved {
         process_resolved_include(
-            &resolved_path, is_system || is_system_header,
+            &resolved_path, is_system || is_system_header, display_path,
             search_paths, cache, deps, visited, macros,
             interner, import_once, options, minimize_opts, is_import,
         )?;
@@ -411,6 +468,7 @@ fn handle_include(
 fn process_resolved_include(
     resolved_path: &Path,
     is_system: bool,
+    resolved_display: Option<PathBuf>,
     search_paths: &SearchPaths,
     cache: &FileCache,
     deps: &mut Vec<DepEntry>,
@@ -427,11 +485,21 @@ fn process_resolved_include(
         Err(_) => return Ok(()),
     };
 
+    // Use the display path from resolution if available, otherwise fall back
+    // to the resolved path if it differs from canonical.
+    let display_path = resolved_display.or_else(|| {
+        if resolved_path != canonical {
+            Some(resolved_path.to_path_buf())
+        } else {
+            None
+        }
+    });
+
     // #import: skip if already imported
     if import_once.contains(&canonical) {
         let interned = interner.intern(&canonical);
         if !deps.iter().any(|d| *d.path == *interned) {
-            deps.push(DepEntry { path: interned, is_system });
+            deps.push(DepEntry { path: interned, display_path: display_path.clone(), is_system });
         }
         return Ok(());
     }
@@ -457,7 +525,7 @@ fn process_resolved_include(
         if dominated {
             let interned = interner.intern(&canonical);
             if !deps.iter().any(|d| *d.path == *interned) {
-                deps.push(DepEntry { path: interned, is_system });
+                deps.push(DepEntry { path: interned, display_path: display_path.clone(), is_system });
             }
             return Ok(());
         }
@@ -471,7 +539,12 @@ fn process_resolved_include(
     }
 
     let interned = interner.intern_owned(canonical.clone());
-    deps.push(DepEntry { path: interned, is_system });
+    deps.push(DepEntry { path: interned, display_path: display_path.clone(), is_system });
+
+    // Compute the "apparent directory" for this file based on its display path.
+    // This propagates non-canonical path segments (e.g., `inc/..`) so that
+    // further includes from this file get correct display paths.
+    let child_display_dir = display_path.as_ref().and_then(|dp| dp.parent().map(|p| p.to_path_buf()));
 
     collect_deps_recursive(
         &canonical,
@@ -485,6 +558,7 @@ fn process_resolved_include(
         options,
         minimize_opts,
         is_system,
+        child_display_dir.as_deref(),
     )?;
 
     Ok(())
@@ -495,7 +569,7 @@ fn add_missing_dep(path: &str, deps: &mut Vec<DepEntry>, interner: &PathInterner
     let p = Path::new(path);
     let interned = interner.intern(p);
     if !deps.iter().any(|d| *d.path == *interned) {
-        deps.push(DepEntry { path: interned, is_system: false });
+        deps.push(DepEntry { path: interned, display_path: None, is_system: false });
     }
 }
 

@@ -64,7 +64,8 @@ pub fn format_makefile_deps_with_options(
         if options.omit_system && dep.is_system {
             continue;
         }
-        let dep_escaped = escape_path(&dep.path);
+        let display = dep.display_path.as_deref().unwrap_or(&dep.path);
+        let dep_escaped = escape_path(display);
         wrap_and_push(&mut out, &mut col, &dep_escaped);
     }
 
@@ -77,7 +78,8 @@ pub fn format_makefile_deps_with_options(
                 continue;
             }
             out.push('\n');
-            let dep_escaped = escape_path(&dep.path);
+            let display = dep.display_path.as_deref().unwrap_or(&dep.path);
+            let dep_escaped = escape_path(display);
             out.push_str(&dep_escaped);
             out.push_str(":\n");
         }
@@ -175,11 +177,11 @@ mod tests {
     use std::sync::Arc;
 
     fn dep(path: &str) -> DepEntry {
-        DepEntry { path: Arc::from(Path::new(path)), is_system: false }
+        DepEntry { path: Arc::from(Path::new(path)), display_path: None, is_system: false }
     }
 
     fn sys_dep(path: &str) -> DepEntry {
-        DepEntry { path: Arc::from(Path::new(path)), is_system: true }
+        DepEntry { path: Arc::from(Path::new(path)), display_path: None, is_system: true }
     }
 
     #[test]

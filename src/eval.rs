@@ -35,8 +35,9 @@ fn eval_inner(expr: &str, macros: &mut MacroTable, depth: u32, ctx: Option<&Eval
     if expr.is_empty() || depth > 64 {
         return 0;
     }
-    // Evaluate __has_include expressions first (before macro expansion)
-    let expr_str = resolve_has_include(expr, ctx);
+    // Evaluate __has_include expressions first (before macro expansion).
+    // Pass macros so macro arguments inside __has_include() can be expanded.
+    let expr_str = resolve_has_include(expr, ctx, Some(macros));
     let expr_ref = expr_str.as_deref().unwrap_or(expr);
     // Expand macros (including function-like) before evaluating
     let expanded = macros.expand(expr_ref);
@@ -47,14 +48,15 @@ fn eval_inner(expr: &str, macros: &mut MacroTable, depth: u32, ctx: Option<&Eval
         return p.parse_expr(0);
     }
     // Re-evaluate the expanded form (may contain further __has_include after expansion)
-    let expanded2 = resolve_has_include(expanded, ctx);
+    let expanded2 = resolve_has_include(expanded, ctx, Some(macros));
     let final_expr = expanded2.as_deref().unwrap_or(expanded);
     let mut p = Parser::new(final_expr, macros);
     p.parse_expr(0)
 }
 
 /// Find and replace `__has_include("path")` / `__has_include(<path>)` with `0` or `1`.
-fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>) -> Option<String> {
+/// If the argument is a macro, expands it first.
+fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>, mut macros: Option<&mut MacroTable>) -> Option<String> {
     if !expr.contains("__has_include") {
         return None;
     }
@@ -107,7 +109,7 @@ fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>) -> Option<Stri
                                     ctx.search_paths.resolve_angle(path).is_some()
                                 } else {
                                     ctx.search_paths
-                                        .resolve_quoted(path, ctx.current_file_dir)
+                                        .resolve_quoted(path, ctx.current_file_dir, None)
                                         .is_some()
                                 }
                             } else {
@@ -119,6 +121,38 @@ fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>) -> Option<Stri
                             continue;
                         }
                     }
+                } else if let Some(ref mut macros) = macros {
+                    // Argument is not a string/angle literal — try macro expansion.
+                    // Extract the full argument up to matching ')'.
+                    let arg_start = j;
+                    let mut depth = 1;
+                    while j < bytes.len() && depth > 0 {
+                        if bytes[j] == b'(' { depth += 1; }
+                        else if bytes[j] == b')' { depth -= 1; }
+                        if depth > 0 { j += 1; }
+                    }
+                    let arg = &expr[arg_start..j];
+                    j += 1; // skip closing ')'
+                    let expanded_arg = macros.expand(arg);
+                    let expanded_arg = expanded_arg.trim();
+                    // Now try to parse as "path" or <path>
+                    let found = if let Some(ctx) = ctx {
+                        if expanded_arg.starts_with('"') && expanded_arg.ends_with('"') && expanded_arg.len() >= 2 {
+                            let path = &expanded_arg[1..expanded_arg.len()-1];
+                            ctx.search_paths.resolve_quoted(path, ctx.current_file_dir, None).is_some()
+                        } else if expanded_arg.starts_with('<') && expanded_arg.ends_with('>') && expanded_arg.len() >= 2 {
+                            let path = &expanded_arg[1..expanded_arg.len()-1];
+                            ctx.search_paths.resolve_angle(path).is_some()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    result.push_str(if found { "1" } else { "0" });
+                    i = j;
+                    changed = true;
+                    continue;
                 }
             }
         }
