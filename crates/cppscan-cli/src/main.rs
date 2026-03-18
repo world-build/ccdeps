@@ -12,8 +12,11 @@ use std::process::Command;
 #[command(name = "cppscan", version, about)]
 struct Args {
     /// Source files to scan.
-    #[arg(required = true)]
     files: Vec<PathBuf>,
+
+    /// Path to a compile_commands.json compilation database.
+    #[arg(short = 'p', long = "compilation-database", value_name = "PATH")]
+    compilation_database: Option<PathBuf>,
 
     /// Add directory to quoted include search path (-iquote).
     #[arg(long = "iquote", value_name = "DIR")]
@@ -44,7 +47,6 @@ struct Args {
     jobs: usize,
 
     // ---- -M family flags ----
-
     /// Print dependencies to stdout (default mode).
     #[arg(short = 'M', long, conflicts_with_all = ["mm", "md", "mmd"])]
     m: bool,
@@ -133,10 +135,7 @@ fn query_compiler_defines(compiler: &str) -> Result<Vec<(String, Option<String>)
         .with_context(|| format!("failed to run '{compiler} -dM -E -'"))?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "'{compiler} -dM -E -' exited with status {}",
-            output.status
-        );
+        anyhow::bail!("'{compiler} -dM -E -' exited with status {}", output.status);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -164,9 +163,7 @@ fn query_compiler_defines(compiler: &str) -> Result<Vec<(String, Option<String>)
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env(),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     // Expand @file response file arguments before clap parsing
@@ -182,11 +179,12 @@ fn main() -> Result<()> {
     }
 
     // Start with compiler-queried macros if requested, then layer user -D flags on top
-    let mut defines: Vec<(String, Option<String>)> = if let Some(ref compiler) = args.compiler_macros {
-        query_compiler_defines(compiler)?
-    } else {
-        Vec::new()
-    };
+    let mut defines: Vec<(String, Option<String>)> =
+        if let Some(ref compiler) = args.compiler_macros {
+            query_compiler_defines(compiler)?
+        } else {
+            Vec::new()
+        };
 
     // Parse -D flags into (name, optional_value) pairs (override builtins)
     defines.extend(args.defines.iter().map(|d| {
@@ -221,32 +219,57 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
-            quote_paths: args.iquote_paths,
-            include_paths: args.include_paths,
-            system_paths: args.system_paths,
-        },
-        target: args.target,
-        defines,
-        dep_mode,
-        dep_file: args.mf,
-        output_options,
-        missing_as_generated: args.mg,
-        trigraphs: args.trigraphs,
-    };
+    let results = if let Some(ref db_path) = args.compilation_database {
+        // Compilation database mode: each entry has its own flags
+        let entries = cppscan::compdb::parse(db_path)
+            .with_context(|| format!("failed to read {}", db_path.display()))?;
 
-    let scanner = Scanner::new(options);
-    let results = scanner.scan_files(&args.files);
+        let scan_entries: Vec<(PathBuf, ScanOptions)> = entries
+            .iter()
+            .map(|entry| {
+                let (source, mut opts) = cppscan::compdb::entry_to_scan_options(entry, &defines);
+                opts.dep_mode = dep_mode;
+                opts.missing_as_generated = args.mg;
+                opts.trigraphs = args.trigraphs;
+                opts.output_options = output_options.clone();
+                (source, opts)
+            })
+            .collect();
+
+        let scanner = Scanner::new(ScanOptions::default());
+        scanner.scan_entries(&scan_entries)
+    } else {
+        if args.files.is_empty() {
+            anyhow::bail!(
+                "no source files specified (use positional args or --compilation-database)"
+            );
+        }
+
+        let options = ScanOptions {
+            search_paths: cppscan::resolve::SearchPaths {
+                quote_paths: args.iquote_paths,
+                include_paths: args.include_paths,
+                system_paths: args.system_paths,
+            },
+            target: args.target,
+            defines,
+            dep_mode,
+            dep_file: args.mf,
+            output_options,
+            missing_as_generated: args.mg,
+            trigraphs: args.trigraphs,
+        };
+
+        let scanner = Scanner::new(options);
+        scanner.scan_files(&args.files)
+    };
 
     for result in results {
         match result {
             Ok(scan) => {
                 if let Some(ref dep_file) = scan.dep_file_path {
-                    // -MD/-MMD: write to file
                     std::fs::write(dep_file, &scan.makefile_output)?;
                 } else {
-                    // -M/-MM: print to stdout
                     print!("{}", scan.makefile_output);
                 }
             }

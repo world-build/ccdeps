@@ -31,6 +31,13 @@ memchr = "2"
 # Arena allocation
 bumpalo = { version = "3", features = ["collections"] }
 
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Shell word splitting (for compile_commands.json "command" field)
+shlex = "1"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

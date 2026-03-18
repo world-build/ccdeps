@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Thread-safe path interner backed by a `DashMap`.
 ///
 /// Canonicalized include paths are stored once and shared via `Arc<Path>`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PathInterner {
     table: DashMap<PathBuf, Arc<Path>>,
 }
@@ -42,12 +42,6 @@ impl PathInterner {
         let arc: Arc<Path> = Arc::from(path.as_path());
         self.table.insert(path, Arc::clone(&arc));
         arc
-    }
-}
-
-impl Default for PathInterner {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

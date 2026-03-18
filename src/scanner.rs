@@ -36,7 +36,7 @@ impl DepMode {
 }
 
 /// Options for the dependency scanner.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
     /// Include search paths.
     pub search_paths: SearchPaths,
@@ -56,21 +56,6 @@ pub struct ScanOptions {
     pub missing_as_generated: bool,
     /// Whether to process trigraphs (`-trigraphs`).
     pub trigraphs: bool,
-}
-
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            search_paths: SearchPaths::default(),
-            target: None,
-            defines: Vec::new(),
-            dep_mode: DepMode::default(),
-            dep_file: None,
-            output_options: OutputOptions::default(),
-            missing_as_generated: false,
-            trigraphs: false,
-        }
-    }
 }
 
 /// Result of scanning a single translation unit.
@@ -126,11 +111,7 @@ impl Scanner {
             }
         }
 
-        let makefile_output = output::format_makefile_deps_with_options(
-            source,
-            &deps,
-            &out_opts,
-        );
+        let makefile_output = output::format_makefile_deps_with_options(source, &deps, &out_opts);
 
         // Determine dep file path
         let dep_file_path = if self.options.dep_mode.writes_to_file() {
@@ -162,11 +143,86 @@ impl Scanner {
     pub fn scan_files(&self, sources: &[PathBuf]) -> Vec<Result<ScanResult, std::io::Error>> {
         if sources.len() <= 1 {
             // Single-file fast path: skip thread pool overhead
-            sources.iter().map(|source| self.scan_file(source)).collect()
+            sources
+                .iter()
+                .map(|source| self.scan_file(source))
+                .collect()
         } else {
             sources
                 .par_iter()
                 .map(|source| self.scan_file(source))
+                .collect()
+        }
+    }
+
+    /// Scan a single file with custom options, sharing this scanner's file cache.
+    ///
+    /// Used by compilation database support where each entry has different
+    /// `-I`/`-D` flags but we want to share the file cache across entries.
+    pub fn scan_file_with_options(
+        &self,
+        source: &Path,
+        options: &ScanOptions,
+    ) -> Result<ScanResult, std::io::Error> {
+        let dep_options = depgraph::DepCollectOptions {
+            missing_as_generated: options.missing_as_generated,
+            trigraphs: options.trigraphs,
+        };
+        let deps = depgraph::collect_deps(
+            source,
+            &options.search_paths,
+            &self.cache,
+            &options.defines,
+            &dep_options,
+        )?;
+
+        let mut out_opts = options.output_options.clone();
+        out_opts.omit_system = options.dep_mode.omit_system();
+
+        if out_opts.targets.is_empty() && out_opts.quoted_targets.is_empty() {
+            if let Some(ref t) = options.target {
+                out_opts.targets.push(t.clone());
+            }
+        }
+
+        let makefile_output = output::format_makefile_deps_with_options(source, &deps, &out_opts);
+
+        let dep_file_path = if options.dep_mode.writes_to_file() {
+            Some(options.dep_file.clone().unwrap_or_else(|| {
+                let mut p = source.to_path_buf();
+                p.set_extension("d");
+                p
+            }))
+        } else {
+            None
+        };
+
+        Ok(ScanResult {
+            source: source.to_path_buf(),
+            deps,
+            makefile_output,
+            dep_file_path,
+        })
+    }
+
+    /// Scan multiple entries, each with their own options, using a shared file cache.
+    ///
+    /// This is the primary API for compilation database support. Each entry can
+    /// have different search paths and defines, but the file cache (minimized
+    /// file contents) is shared across all entries for performance.
+    pub fn scan_entries(
+        &self,
+        entries: &[(PathBuf, ScanOptions)],
+    ) -> Vec<Result<ScanResult, std::io::Error>> {
+        if entries.len() <= 1 {
+            entries
+                .iter()
+                .map(|(source, opts)| self.scan_file_with_options(source, opts))
+                .collect()
+        } else {
+            entries
+                .par_iter()
+                .map(|(source, opts)| self.scan_file_with_options(source, opts))
                 .collect()
         }
     }
@@ -222,7 +278,11 @@ mod tests {
         let result = scanner.scan_file(&dir.path().join("main.c")).unwrap();
 
         assert!(result.dep_file_path.is_some());
-        assert!(result.dep_file_path.unwrap().to_string_lossy().ends_with(".d"));
+        assert!(result
+            .dep_file_path
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".d"));
     }
 
     #[test]

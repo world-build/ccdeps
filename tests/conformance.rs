@@ -42,7 +42,11 @@ fn parse_makefile_deps(output: &str) -> BTreeSet<String> {
 }
 
 /// Run a compiler with -M flag and return parsed dependencies.
-fn get_compiler_deps(compiler: &str, source: &Path, include_paths: &[PathBuf]) -> Option<BTreeSet<String>> {
+fn get_compiler_deps(
+    compiler: &str,
+    source: &Path,
+    include_paths: &[PathBuf],
+) -> Option<BTreeSet<String>> {
     let mut cmd = Command::new(compiler);
     cmd.arg("-M").arg(source);
     for path in include_paths {
@@ -102,11 +106,7 @@ impl TestCase {
 // ---- Conformance tests ----
 
 /// Compare cppscan vs gcc/clang on a test case. Skips if compiler not available.
-fn assert_matches_compiler(
-    source: &Path,
-    include_paths: &[PathBuf],
-    compiler: &str,
-) {
+fn assert_matches_compiler(source: &Path, include_paths: &[PathBuf], compiler: &str) {
     let cppscan_deps = get_cppscan_deps(source, include_paths);
 
     if let Some(compiler_deps) = get_compiler_deps(compiler, source, include_paths) {
@@ -126,10 +126,8 @@ fn assert_matches_compiler(
             .into_iter()
             .filter(|p| !is_system(p))
             .collect();
-        let cppscan_only_filtered: BTreeSet<_> = cppscan_only
-            .into_iter()
-            .filter(|p| !is_system(p))
-            .collect();
+        let cppscan_only_filtered: BTreeSet<_> =
+            cppscan_only.into_iter().filter(|p| !is_system(p)).collect();
 
         assert!(
             cppscan_only_filtered.is_empty() && compiler_only_filtered.is_empty(),
@@ -276,8 +274,8 @@ fn conformance_subdirectory_includes() {
     let source = tc.write_file("main.c", "#include \"mid.h\"\n");
 
     let inc_path = tc.path().join("inc");
-    assert_matches_compiler(&source, &[inc_path.clone()], "gcc");
-    assert_matches_compiler(&source, &[inc_path], "clang");
+    assert_matches_compiler(&source, std::slice::from_ref(&inc_path), "gcc");
+    assert_matches_compiler(&source, std::slice::from_ref(&inc_path), "clang");
 }
 
 // ---- Phase 2: computed includes, function-like macros, __has_include ----
@@ -428,8 +426,14 @@ fn conformance_mm_omits_system_headers() {
     let result = scanner.scan_file(&source).unwrap();
     let deps = parse_makefile_deps(&result.makefile_output);
 
-    assert!(deps.iter().any(|d| d.contains("user.h")), "should include user.h");
-    assert!(!deps.iter().any(|d| d.contains("sys.h")), "should omit sys.h");
+    assert!(
+        deps.iter().any(|d| d.contains("user.h")),
+        "should include user.h"
+    );
+    assert!(
+        !deps.iter().any(|d| d.contains("sys.h")),
+        "should omit sys.h"
+    );
 }
 
 #[test]
@@ -470,7 +474,11 @@ fn conformance_mp_phony_targets() {
             phony_count += 1;
         }
     }
-    assert!(phony_count >= 2, "expected at least 2 phony targets, got {}", phony_count);
+    assert!(
+        phony_count >= 2,
+        "expected at least 2 phony targets, got {}",
+        phony_count
+    );
 }
 
 #[test]
@@ -576,7 +584,10 @@ fn conformance_md_writes_dep_file() {
     let scanner = Scanner::new(options);
     let result = scanner.scan_file(&source).unwrap();
 
-    assert!(result.dep_file_path.is_some(), "MD mode should set dep_file_path");
+    assert!(
+        result.dep_file_path.is_some(),
+        "MD mode should set dep_file_path"
+    );
     let dep_path = result.dep_file_path.unwrap();
     assert!(
         dep_path.to_string_lossy().ends_with(".d"),
@@ -634,7 +645,10 @@ fn conformance_mm_with_mp_phony_omits_system() {
 
     let output = &result.makefile_output;
     assert!(output.contains("user.h"), "should include user.h");
-    assert!(!output.contains("sys.h"), "should omit sys.h everywhere including phony");
+    assert!(
+        !output.contains("sys.h"),
+        "should omit sys.h everywhere including phony"
+    );
 }
 
 // ---- Phase 5: Edge Cases & Full Conformance ----
@@ -666,7 +680,11 @@ fn conformance_include_next() {
 
     // Should find both wrapper.h files (dir1 and dir2)
     let wrapper_count = deps.iter().filter(|d| d.contains("wrapper.h")).count();
-    assert_eq!(wrapper_count, 2, "should find both wrapper.h files: {:?}", deps);
+    assert_eq!(
+        wrapper_count, 2,
+        "should find both wrapper.h files: {:?}",
+        deps
+    );
 }
 
 #[test]
@@ -693,7 +711,11 @@ fn conformance_import_once_only() {
     let deps = parse_makefile_deps(&result.makefile_output);
 
     let imported_count = deps.iter().filter(|d| d.contains("imported.h")).count();
-    assert_eq!(imported_count, 1, "imported.h should appear exactly once: {:?}", deps);
+    assert_eq!(
+        imported_count, 1,
+        "imported.h should appear exactly once: {:?}",
+        deps
+    );
 }
 
 #[test]
@@ -730,18 +752,21 @@ fn conformance_pragma_push_pop_macro() {
     let scanner = Scanner::new(options);
     let result = scanner.scan_file(&source).unwrap();
 
-    assert!(result.makefile_output.contains("yes.h"), "should include yes.h");
-    assert!(!result.makefile_output.contains("no.h"), "should not include no.h (FOO restored by pop_macro)");
+    assert!(
+        result.makefile_output.contains("yes.h"),
+        "should include yes.h"
+    );
+    assert!(
+        !result.makefile_output.contains("no.h"),
+        "should not include no.h (FOO restored by pop_macro)"
+    );
 }
 
 #[test]
 fn conformance_mg_missing_headers() {
     let tc = TestCase::new();
 
-    let source = tc.write_file(
-        "main.c",
-        "#include \"generated.h\"\nint main() {}\n",
-    );
+    let source = tc.write_file("main.c", "#include \"generated.h\"\nint main() {}\n");
 
     let options = ScanOptions {
         missing_as_generated: true,
@@ -764,10 +789,7 @@ fn conformance_trigraph_hash() {
 
     tc.write_file("foo.h", "int foo;\n");
     // ??= is the trigraph for #
-    let source = tc.write_file(
-        "main.c",
-        "??=include \"foo.h\"\nint main() {}\n",
-    );
+    let source = tc.write_file("main.c", "??=include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
         search_paths: cppscan::resolve::SearchPaths {
@@ -794,10 +816,7 @@ fn conformance_digraph_hash() {
 
     tc.write_file("foo.h", "int foo;\n");
     // %: is the digraph for #
-    let source = tc.write_file(
-        "main.c",
-        "%:include \"foo.h\"\nint main() {}\n",
-    );
+    let source = tc.write_file("main.c", "%:include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
         search_paths: cppscan::resolve::SearchPaths {
@@ -827,10 +846,7 @@ fn conformance_pragma_system_header_mm() {
         "sys_wrapper.h",
         "#pragma GCC system_header\n#include \"inner.h\"\n",
     );
-    let source = tc.write_file(
-        "main.c",
-        "#include \"sys_wrapper.h\"\nint main() {}\n",
-    );
+    let source = tc.write_file("main.c", "#include \"sys_wrapper.h\"\nint main() {}\n");
 
     // With -MM, system headers should be omitted. sys_wrapper.h itself is not system
     // (it's found via a non-system path), but inner.h included from it is treated as system
@@ -848,11 +864,17 @@ fn conformance_pragma_system_header_mm() {
     let result = scanner.scan_file(&source).unwrap();
 
     // sys_wrapper.h should still appear (it was included from a non-system path)
-    assert!(result.makefile_output.contains("sys_wrapper.h"),
-            "sys_wrapper.h should be in deps: {}", result.makefile_output);
+    assert!(
+        result.makefile_output.contains("sys_wrapper.h"),
+        "sys_wrapper.h should be in deps: {}",
+        result.makefile_output
+    );
     // inner.h should be omitted with -MM since it's under system_header pragma
-    assert!(!result.makefile_output.contains("inner.h"),
-            "inner.h should be omitted with -MM under system_header: {}", result.makefile_output);
+    assert!(
+        !result.makefile_output.contains("inner.h"),
+        "inner.h should be omitted with -MM under system_header: {}",
+        result.makefile_output
+    );
 }
 
 // ---- Unit tests for the dep parser ----

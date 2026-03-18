@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use cppscan::minimize;
 use cppscan::{ScanOptions, Scanner};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +15,7 @@ fn collect_files_recursive(dir: &Path, ext: &str) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 files.extend(collect_files_recursive(&path, ext));
-            } else if path.extension().map_or(false, |e| e == ext) {
+            } else if path.extension().is_some_and(|e| e == ext) {
                 files.push(path);
             }
         }
@@ -71,14 +71,8 @@ fn bench_minimize_with_strings_and_comments(c: &mut Criterion) {
     let mut source = String::new();
     source.push_str("#include <stdio.h>\n");
     for i in 0..500 {
-        source.push_str(&format!(
-            "char *s_{} = \"#include <fake_{}.h>\";\n",
-            i, i
-        ));
-        source.push_str(&format!(
-            "// This is a comment with #define FAKE_{}\n",
-            i
-        ));
+        source.push_str(&format!("char *s_{} = \"#include <fake_{}.h>\";\n", i, i));
+        source.push_str(&format!("// This is a comment with #define FAKE_{}\n", i));
         source.push_str(&format!(
             "/* Block comment with #include \"fake_{}.h\" */\n",
             i
@@ -96,7 +90,7 @@ fn bench_minimize_with_strings_and_comments(c: &mut Criterion) {
 fn bench_minimize_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("minimize_by_size");
 
-    for &size_kb in &[1, 4, 16, 64, 256] {
+    for size_kb in [1, 4, 16, 64, 256] {
         let mut source = String::new();
         source.push_str("#include <stdio.h>\n");
         while source.len() < size_kb * 1024 {
@@ -209,7 +203,10 @@ fn bench_minimize_real(c: &mut Criterion) {
     }
 
     let files = [
-        ("small_4KB", "/tmp/clang/clang/lib/DirectoryWatcher/DirectoryScanner.cpp"),
+        (
+            "small_4KB",
+            "/tmp/clang/clang/lib/DirectoryWatcher/DirectoryScanner.cpp",
+        ),
         ("medium_210KB", "/tmp/clang/clang/lib/AST/Expr.cpp"),
         ("large_886KB", "/tmp/clang/clang/lib/Sema/SemaExpr.cpp"),
         ("xlarge_1MB", "/tmp/clang/clang/lib/Sema/SemaOpenMP.cpp"),
@@ -275,35 +272,27 @@ fn bench_scan_parallel_real(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_parallel_real");
     group.sample_size(10);
 
-    for &count in &[10, 100, 1000] {
+    for count in [10, 100, 1000] {
         let n = count.min(all_sources.len());
         let sources: Vec<PathBuf> = all_sources[..n].to_vec();
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(
-            BenchmarkId::new("files", n),
-            &sources,
-            |b, srcs| {
-                b.iter(|| {
-                    let scanner = Scanner::new(real_scan_options());
-                    scanner.scan_files(srcs);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("files", n), &sources, |b, srcs| {
+            b.iter(|| {
+                let scanner = Scanner::new(real_scan_options());
+                scanner.scan_files(srcs);
+            });
+        });
     }
 
     // All files
     let n = all_sources.len();
     group.throughput(Throughput::Elements(n as u64));
-    group.bench_with_input(
-        BenchmarkId::new("files", n),
-        &all_sources,
-        |b, srcs| {
-            b.iter(|| {
-                let scanner = Scanner::new(real_scan_options());
-                scanner.scan_files(srcs);
-            });
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("files", n), &all_sources, |b, srcs| {
+        b.iter(|| {
+            let scanner = Scanner::new(real_scan_options());
+            scanner.scan_files(srcs);
+        });
+    });
 
     group.finish();
 }

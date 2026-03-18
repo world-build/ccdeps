@@ -30,7 +30,12 @@ pub fn evaluate_with_context(expr: &str, macros: &mut MacroTable, ctx: &EvalCont
     eval_inner(expr, macros, 0, Some(ctx))
 }
 
-fn eval_inner(expr: &str, macros: &mut MacroTable, depth: u32, ctx: Option<&EvalContext<'_>>) -> i64 {
+fn eval_inner(
+    expr: &str,
+    macros: &mut MacroTable,
+    depth: u32,
+    ctx: Option<&EvalContext<'_>>,
+) -> i64 {
     let expr = expr.trim();
     if expr.is_empty() || depth > 64 {
         return 0;
@@ -56,7 +61,11 @@ fn eval_inner(expr: &str, macros: &mut MacroTable, depth: u32, ctx: Option<&Eval
 
 /// Find and replace `__has_include("path")` / `__has_include(<path>)` with `0` or `1`.
 /// If the argument is a macro, expands it first.
-fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>, mut macros: Option<&mut MacroTable>) -> Option<String> {
+fn resolve_has_include(
+    expr: &str,
+    ctx: Option<&EvalContext<'_>>,
+    mut macros: Option<&mut MacroTable>,
+) -> Option<String> {
     if !expr.contains("__has_include") {
         return None;
     }
@@ -97,7 +106,7 @@ fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>, mut macros: Op
                     if j < bytes.len() {
                         let path = &expr[path_start..j];
                         j += 1; // skip close delimiter
-                        // Skip whitespace and closing paren
+                                // Skip whitespace and closing paren
                         while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                             j += 1;
                         }
@@ -127,9 +136,14 @@ fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>, mut macros: Op
                     let arg_start = j;
                     let mut depth = 1;
                     while j < bytes.len() && depth > 0 {
-                        if bytes[j] == b'(' { depth += 1; }
-                        else if bytes[j] == b')' { depth -= 1; }
-                        if depth > 0 { j += 1; }
+                        if bytes[j] == b'(' {
+                            depth += 1;
+                        } else if bytes[j] == b')' {
+                            depth -= 1;
+                        }
+                        if depth > 0 {
+                            j += 1;
+                        }
                     }
                     let arg = &expr[arg_start..j];
                     j += 1; // skip closing ')'
@@ -137,11 +151,19 @@ fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>, mut macros: Op
                     let expanded_arg = expanded_arg.trim();
                     // Now try to parse as "path" or <path>
                     let found = if let Some(ctx) = ctx {
-                        if expanded_arg.starts_with('"') && expanded_arg.ends_with('"') && expanded_arg.len() >= 2 {
-                            let path = &expanded_arg[1..expanded_arg.len()-1];
-                            ctx.search_paths.resolve_quoted(path, ctx.current_file_dir, None).is_some()
-                        } else if expanded_arg.starts_with('<') && expanded_arg.ends_with('>') && expanded_arg.len() >= 2 {
-                            let path = &expanded_arg[1..expanded_arg.len()-1];
+                        if expanded_arg.starts_with('"')
+                            && expanded_arg.ends_with('"')
+                            && expanded_arg.len() >= 2
+                        {
+                            let path = &expanded_arg[1..expanded_arg.len() - 1];
+                            ctx.search_paths
+                                .resolve_quoted(path, ctx.current_file_dir, None)
+                                .is_some()
+                        } else if expanded_arg.starts_with('<')
+                            && expanded_arg.ends_with('>')
+                            && expanded_arg.len() >= 2
+                        {
+                            let path = &expanded_arg[1..expanded_arg.len() - 1];
                             ctx.search_paths.resolve_angle(path).is_some()
                         } else {
                             false
@@ -160,7 +182,11 @@ fn resolve_has_include(expr: &str, ctx: Option<&EvalContext<'_>>, mut macros: Op
         i += 1;
     }
 
-    if changed { Some(result) } else { None }
+    if changed {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,9 +267,7 @@ impl<'a> Lexer<'a> {
 
         // Character literal: 'x' or L'x'
         if b == b'\''
-            || (b == b'L'
-                && self.pos + 1 < self.input.len()
-                && self.input[self.pos + 1] == b'\'')
+            || (b == b'L' && self.pos + 1 < self.input.len() && self.input[self.pos + 1] == b'\'')
         {
             return self.lex_char();
         }
@@ -337,9 +361,7 @@ impl<'a> Lexer<'a> {
             match self.input[self.pos + 1] {
                 b'x' | b'X' => {
                     self.pos += 2;
-                    while self.pos < self.input.len()
-                        && self.input[self.pos].is_ascii_hexdigit()
-                    {
+                    while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
                         let d = self.input[self.pos];
                         val = val.wrapping_mul(16).wrapping_add(match d {
                             b'0'..=b'9' => (d - b'0') as i64,
@@ -501,8 +523,6 @@ impl<'a> Parser<'a> {
                 n
             }
             Token::Ident(name) => {
-                // Copy name before advancing (it borrows from input, stays valid)
-                let name = name;
                 self.advance();
 
                 if name == "defined" {
@@ -604,22 +624,15 @@ impl<'a> Parser<'a> {
             return 0;
         };
 
-        let result = if self.macros.is_defined(name) {
-            1
-        } else {
-            0
-        };
+        let result = if self.macros.is_defined(name) { 1 } else { 0 };
         self.advance();
 
-        if has_paren {
-            if self.token == Token::RParen {
-                self.advance();
-            }
+        if has_paren && self.token == Token::RParen {
+            self.advance();
         }
 
         result
     }
-
 }
 
 fn apply_binop(op: Token<'_>, lhs: i64, rhs: i64) -> i64 {
@@ -947,19 +960,11 @@ mod tests {
         };
         let mut m = MacroTable::new();
         assert_eq!(
-            evaluate_with_context(
-                "__has_include(\"opt.h\") && 1",
-                &mut m,
-                &ctx,
-            ),
+            evaluate_with_context("__has_include(\"opt.h\") && 1", &mut m, &ctx,),
             1
         );
         assert_eq!(
-            evaluate_with_context(
-                "__has_include(\"nope.h\") || 0",
-                &mut m,
-                &ctx,
-            ),
+            evaluate_with_context("__has_include(\"nope.h\") || 0", &mut m, &ctx,),
             0
         );
     }

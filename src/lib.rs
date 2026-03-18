@@ -36,16 +36,17 @@
 //! - **Lexer skip optimization**: When `#if` evaluates to false, skip directly
 //!   to matching `#endif` without processing contents
 
-pub mod minimize;
+pub mod compdb;
+pub mod depgraph;
 pub mod directive;
 pub mod eval;
 pub mod intern;
 pub mod macros;
-pub mod resolve;
-pub mod depgraph;
+pub mod minimize;
 pub mod output;
+pub mod resolve;
 pub mod scanner;
 
-pub use scanner::{Scanner, ScanResult, ScanOptions, DepMode};
-pub use depgraph::{DepEntry, DepCollectOptions};
+pub use depgraph::{DepCollectOptions, DepEntry};
 pub use output::OutputOptions;
+pub use scanner::{DepMode, ScanOptions, ScanResult, Scanner};

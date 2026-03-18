@@ -132,7 +132,7 @@ impl ConditionalStack {
 
     /// Whether directives at the current position should be processed.
     fn is_active(&self) -> bool {
-        self.stack.last().map_or(true, |s| s.active)
+        self.stack.last().is_none_or(|s| s.active)
     }
 
     fn push_if(&mut self, condition: bool) {
@@ -174,6 +174,7 @@ impl ConditionalStack {
 // Recursive dependency collection
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn collect_deps_recursive(
     file_path: &Path,
     search_paths: &SearchPaths,
@@ -289,23 +290,45 @@ fn collect_deps_recursive(
             }
             Directive::Include(ref inc) => {
                 handle_include(
-                    inc, file_path, search_paths, cache, deps, visited, macros,
-                    interner, import_once, options, minimize_opts, is_system_header,
+                    inc,
+                    file_path,
+                    search_paths,
+                    cache,
+                    deps,
+                    visited,
+                    macros,
+                    interner,
+                    import_once,
+                    options,
+                    minimize_opts,
+                    is_system_header,
                     false, // is_import
                     display_dir,
                 )?;
             }
             Directive::IncludeNext(ref inc) => {
                 // #include_next: resolve starting from the next search directory
-                let resolved = search_paths.resolve_include_next(
-                    inc.path,
-                    current_dir,
-                );
-                if let Some(ResolvedInclude { path: resolved_path, is_system, display_path }) = resolved {
+                let resolved = search_paths.resolve_include_next(inc.path, current_dir);
+                if let Some(ResolvedInclude {
+                    path: resolved_path,
+                    is_system,
+                    display_path,
+                }) = resolved
+                {
                     process_resolved_include(
-                        &resolved_path, is_system || is_system_header, display_path,
-                        search_paths, cache, deps, visited, macros,
-                        interner, import_once, options, minimize_opts, false,
+                        &resolved_path,
+                        is_system || is_system_header,
+                        display_path,
+                        search_paths,
+                        cache,
+                        deps,
+                        visited,
+                        macros,
+                        interner,
+                        import_once,
+                        options,
+                        minimize_opts,
+                        false,
                     )?;
                 } else if options.missing_as_generated {
                     add_missing_dep(inc.path, deps, interner);
@@ -313,8 +336,18 @@ fn collect_deps_recursive(
             }
             Directive::Import(ref inc) => {
                 handle_include(
-                    inc, file_path, search_paths, cache, deps, visited, macros,
-                    interner, import_once, options, minimize_opts, is_system_header,
+                    inc,
+                    file_path,
+                    search_paths,
+                    cache,
+                    deps,
+                    visited,
+                    macros,
+                    interner,
+                    import_once,
+                    options,
+                    minimize_opts,
+                    is_system_header,
                     true, // is_import
                     display_dir,
                 )?;
@@ -344,7 +377,12 @@ fn collect_deps_recursive(
                         }
                     }
                 };
-                if let Some(ResolvedInclude { path: resolved_path, is_system, display_path: res_display }) = resolved {
+                if let Some(ResolvedInclude {
+                    path: resolved_path,
+                    is_system,
+                    display_path: res_display,
+                }) = resolved
+                {
                     let canonical = match std::fs::canonicalize(&resolved_path) {
                         Ok(c) => c,
                         Err(_) => continue,
@@ -412,6 +450,7 @@ fn extract_pragma_macro_name(s: &str) -> Option<&str> {
 }
 
 /// Handle an `#include` or `#import` directive.
+#[allow(clippy::too_many_arguments)]
 fn handle_include(
     inc: &IncludeDirective<'_>,
     file_path: &Path,
@@ -451,11 +490,26 @@ fn handle_include(
         }
     };
 
-    if let Some(ResolvedInclude { path: resolved_path, is_system, display_path }) = resolved {
+    if let Some(ResolvedInclude {
+        path: resolved_path,
+        is_system,
+        display_path,
+    }) = resolved
+    {
         process_resolved_include(
-            &resolved_path, is_system || is_system_header, display_path,
-            search_paths, cache, deps, visited, macros,
-            interner, import_once, options, minimize_opts, is_import,
+            &resolved_path,
+            is_system || is_system_header,
+            display_path,
+            search_paths,
+            cache,
+            deps,
+            visited,
+            macros,
+            interner,
+            import_once,
+            options,
+            minimize_opts,
+            is_import,
         )?;
     } else if options.missing_as_generated {
         add_missing_dep(inc.path, deps, interner);
@@ -465,6 +519,7 @@ fn handle_include(
 }
 
 /// Process a resolved include path: check guards, add to deps, recurse.
+#[allow(clippy::too_many_arguments)]
 fn process_resolved_include(
     resolved_path: &Path,
     is_system: bool,
@@ -499,7 +554,11 @@ fn process_resolved_include(
     if import_once.contains(&canonical) {
         let interned = interner.intern(&canonical);
         if !deps.iter().any(|d| *d.path == *interned) {
-            deps.push(DepEntry { path: interned, display_path: display_path.clone(), is_system });
+            deps.push(DepEntry {
+                path: interned,
+                display_path: display_path.clone(),
+                is_system,
+            });
         }
         return Ok(());
     }
@@ -525,7 +584,11 @@ fn process_resolved_include(
         if dominated {
             let interned = interner.intern(&canonical);
             if !deps.iter().any(|d| *d.path == *interned) {
-                deps.push(DepEntry { path: interned, display_path: display_path.clone(), is_system });
+                deps.push(DepEntry {
+                    path: interned,
+                    display_path: display_path.clone(),
+                    is_system,
+                });
             }
             return Ok(());
         }
@@ -539,12 +602,18 @@ fn process_resolved_include(
     }
 
     let interned = interner.intern_owned(canonical.clone());
-    deps.push(DepEntry { path: interned, display_path: display_path.clone(), is_system });
+    deps.push(DepEntry {
+        path: interned,
+        display_path: display_path.clone(),
+        is_system,
+    });
 
     // Compute the "apparent directory" for this file based on its display path.
     // This propagates non-canonical path segments (e.g., `inc/..`) so that
     // further includes from this file get correct display paths.
-    let child_display_dir = display_path.as_ref().and_then(|dp| dp.parent().map(|p| p.to_path_buf()));
+    let child_display_dir = display_path
+        .as_ref()
+        .and_then(|dp| dp.parent().map(|p| p.to_path_buf()));
 
     collect_deps_recursive(
         &canonical,
@@ -569,7 +638,11 @@ fn add_missing_dep(path: &str, deps: &mut Vec<DepEntry>, interner: &PathInterner
     let p = Path::new(path);
     let interned = interner.intern(p);
     if !deps.iter().any(|d| *d.path == *interned) {
-        deps.push(DepEntry { path: interned, display_path: None, is_system: false });
+        deps.push(DepEntry {
+            path: interned,
+            display_path: None,
+            is_system: false,
+        });
     }
 }
 
@@ -577,9 +650,9 @@ fn add_missing_dep(path: &str, deps: &mut Vec<DepEntry>, interner: &PathInterner
 /// Handles `"path"` and `<path>` forms.
 fn extract_include_path(expanded: &str) -> Option<String> {
     let s = expanded.trim();
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        Some(s[1..s.len() - 1].to_string())
-    } else if s.starts_with('<') && s.ends_with('>') && s.len() >= 2 {
+    let is_quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
+    let is_angle = s.starts_with('<') && s.ends_with('>') && s.len() >= 2;
+    if is_quoted || is_angle {
         Some(s[1..s.len() - 1].to_string())
     } else {
         None
@@ -644,8 +717,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("a.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("a.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         assert_eq!(deps.len(), 2); // b.h, c.h
     }
 
@@ -668,8 +747,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let guarded_count = deps
             .iter()
             .filter(|d| d.path.file_name().unwrap() == "guarded.h")
@@ -692,8 +777,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -717,8 +808,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -742,8 +839,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -768,8 +871,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -794,8 +903,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -840,11 +955,7 @@ mod tests {
     fn test_define_in_header_visible_after_include() {
         let dir = tempfile::tempdir().unwrap();
 
-        fs::write(
-            dir.path().join("config.h"),
-            "#define HAS_FEATURE 1\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("config.h"), "#define HAS_FEATURE 1\n").unwrap();
         fs::write(dir.path().join("feature.h"), "// feature\n").unwrap();
         fs::write(
             dir.path().join("main.c"),
@@ -855,8 +966,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -879,8 +996,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -902,8 +1025,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -926,8 +1055,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
@@ -951,8 +1086,14 @@ mod tests {
         let search_paths = SearchPaths::default();
         let cache = new_file_cache();
 
-        let deps =
-            collect_deps(&dir.path().join("main.c"), &search_paths, &cache, &[], &DepCollectOptions::default()).unwrap();
+        let deps = collect_deps(
+            &dir.path().join("main.c"),
+            &search_paths,
+            &cache,
+            &[],
+            &DepCollectOptions::default(),
+        )
+        .unwrap();
         let names: Vec<_> = deps
             .iter()
             .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())

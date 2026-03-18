@@ -26,11 +26,7 @@ pub struct OutputOptions {
 /// Format dependencies in Makefile format, matching `gcc -M` output.
 ///
 /// This is the simple API for backward compatibility (equivalent to `-M`).
-pub fn format_makefile_deps(
-    source: &Path,
-    deps: &[DepEntry],
-    target: Option<&str>,
-) -> String {
+pub fn format_makefile_deps(source: &Path, deps: &[DepEntry], target: Option<&str>) -> String {
     let options = match target {
         Some(t) => OutputOptions {
             targets: vec![t.to_string()],
@@ -177,11 +173,19 @@ mod tests {
     use std::sync::Arc;
 
     fn dep(path: &str) -> DepEntry {
-        DepEntry { path: Arc::from(Path::new(path)), display_path: None, is_system: false }
+        DepEntry {
+            path: Arc::from(Path::new(path)),
+            display_path: None,
+            is_system: false,
+        }
     }
 
     fn sys_dep(path: &str) -> DepEntry {
-        DepEntry { path: Arc::from(Path::new(path)), display_path: None, is_system: true }
+        DepEntry {
+            path: Arc::from(Path::new(path)),
+            display_path: None,
+            is_system: true,
+        }
     }
 
     #[test]
@@ -215,7 +219,10 @@ mod tests {
             .map(|i| dep(&format!("/very/long/path/to/header{}.h", i)))
             .collect();
         let result = format_makefile_deps(source, &deps, None);
-        assert!(result.contains(" \\\n "), "should contain continuation lines");
+        assert!(
+            result.contains(" \\\n "),
+            "should contain continuation lines"
+        );
         // Verify no line exceeds MAX_COLUMNS (before the backslash)
         for line in result.lines() {
             let content = line.trim_end_matches(" \\");
@@ -227,17 +234,29 @@ mod tests {
     fn test_phony_targets() {
         let source = Path::new("main.c");
         let deps = vec![dep("foo.h"), dep("bar.h")];
-        let options = OutputOptions { phony: true, ..Default::default() };
+        let options = OutputOptions {
+            phony: true,
+            ..Default::default()
+        };
         let result = format_makefile_deps_with_options(source, &deps, &options);
-        assert!(result.contains("\nfoo.h:\n"), "missing phony target for foo.h");
-        assert!(result.contains("\nbar.h:\n"), "missing phony target for bar.h");
+        assert!(
+            result.contains("\nfoo.h:\n"),
+            "missing phony target for foo.h"
+        );
+        assert!(
+            result.contains("\nbar.h:\n"),
+            "missing phony target for bar.h"
+        );
     }
 
     #[test]
     fn test_omit_system_headers() {
         let source = Path::new("main.c");
         let deps = vec![dep("user.h"), sys_dep("system.h")];
-        let options = OutputOptions { omit_system: true, ..Default::default() };
+        let options = OutputOptions {
+            omit_system: true,
+            ..Default::default()
+        };
         let result = format_makefile_deps_with_options(source, &deps, &options);
         assert!(result.contains("user.h"), "should include user header");
         assert!(!result.contains("system.h"), "should omit system header");
@@ -246,7 +265,10 @@ mod tests {
     #[test]
     fn test_mq_quoting() {
         assert_eq!(quote_target("main.o"), "main.o");
-        assert_eq!(quote_target("path with space/main.o"), "path\\ with\\ space/main.o");
+        assert_eq!(
+            quote_target("path with space/main.o"),
+            "path\\ with\\ space/main.o"
+        );
         assert_eq!(quote_target("$var.o"), "$$var.o");
         assert_eq!(quote_target("file#1.o"), "file\\#1.o");
     }
@@ -280,9 +302,16 @@ mod tests {
     fn test_phony_with_omit_system() {
         let source = Path::new("main.c");
         let deps = vec![dep("user.h"), sys_dep("sys.h")];
-        let options = OutputOptions { phony: true, omit_system: true, ..Default::default() };
+        let options = OutputOptions {
+            phony: true,
+            omit_system: true,
+            ..Default::default()
+        };
         let result = format_makefile_deps_with_options(source, &deps, &options);
-        assert!(result.contains("\nuser.h:\n"), "should have phony for user.h");
+        assert!(
+            result.contains("\nuser.h:\n"),
+            "should have phony for user.h"
+        );
         assert!(!result.contains("sys.h"), "should not have phony for sys.h");
     }
 }

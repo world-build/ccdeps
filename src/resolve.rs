@@ -18,7 +18,7 @@ pub struct ResolvedInclude {
 }
 
 /// Configuration for include path resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchPaths {
     /// Paths from `-iquote` — searched only for `#include "..."`.
     pub quote_paths: Vec<PathBuf>,
@@ -26,16 +26,6 @@ pub struct SearchPaths {
     pub include_paths: Vec<PathBuf>,
     /// Paths from `-isystem` — system include paths.
     pub system_paths: Vec<PathBuf>,
-}
-
-impl Default for SearchPaths {
-    fn default() -> Self {
-        Self {
-            quote_paths: Vec::new(),
-            include_paths: Vec::new(),
-            system_paths: Vec::new(),
-        }
-    }
 }
 
 impl SearchPaths {
@@ -66,7 +56,11 @@ impl SearchPaths {
                 including_file_dir,
                 path,
             );
-            return Some(ResolvedInclude { path: candidate, is_system: false, display_path: display });
+            return Some(ResolvedInclude {
+                path: candidate,
+                is_system: false,
+                display_path: display,
+            });
         }
 
         // 2. -iquote paths
@@ -74,7 +68,11 @@ impl SearchPaths {
             let candidate = dir.join(path);
             if candidate.is_file() {
                 let display = make_display_path(dir, path);
-                return Some(ResolvedInclude { path: candidate, is_system: false, display_path: display });
+                return Some(ResolvedInclude {
+                    path: candidate,
+                    is_system: false,
+                    display_path: display,
+                });
             }
         }
 
@@ -92,7 +90,11 @@ impl SearchPaths {
             let candidate = dir.join(path);
             if candidate.is_file() {
                 let display = make_display_path(dir, path);
-                return Some(ResolvedInclude { path: candidate, is_system: false, display_path: display });
+                return Some(ResolvedInclude {
+                    path: candidate,
+                    is_system: false,
+                    display_path: display,
+                });
             }
         }
 
@@ -100,7 +102,11 @@ impl SearchPaths {
             let candidate = dir.join(path);
             if candidate.is_file() {
                 let display = make_display_path(dir, path);
-                return Some(ResolvedInclude { path: candidate, is_system: true, display_path: display });
+                return Some(ResolvedInclude {
+                    path: candidate,
+                    is_system: true,
+                    display_path: display,
+                });
             }
         }
 
@@ -111,12 +117,10 @@ impl SearchPaths {
     /// after `found_in_dir` in the search path order.
     ///
     /// This is a GNU extension used heavily in system headers (e.g., glibc wrappers).
-    pub fn resolve_include_next(
-        &self,
-        path: &str,
-        found_in_dir: &Path,
-    ) -> Option<ResolvedInclude> {
-        let all_paths = self.quote_paths.iter()
+    pub fn resolve_include_next(&self, path: &str, found_in_dir: &Path) -> Option<ResolvedInclude> {
+        let all_paths = self
+            .quote_paths
+            .iter()
             .chain(self.include_paths.iter())
             .chain(self.system_paths.iter());
 
@@ -132,7 +136,11 @@ impl SearchPaths {
             if candidate.is_file() {
                 let is_system = self.system_paths.iter().any(|sp| sp == dir);
                 let display = make_display_path(dir, path);
-                return Some(ResolvedInclude { path: candidate, is_system, display_path: display });
+                return Some(ResolvedInclude {
+                    path: candidate,
+                    is_system,
+                    display_path: display,
+                });
             }
         }
 
@@ -150,7 +158,10 @@ fn make_display_path(dir: &Path, raw_include_path: &str) -> Option<PathBuf> {
         // Build the path as a string to preserve ./ and ../ segments
         let dir_str = dir.to_string_lossy();
         let sep = if dir_str.ends_with('/') { "" } else { "/" };
-        Some(PathBuf::from(format!("{}{}{}", dir_str, sep, raw_include_path)))
+        Some(PathBuf::from(format!(
+            "{}{}{}",
+            dir_str, sep, raw_include_path
+        )))
     } else {
         None
     }
@@ -170,7 +181,10 @@ fn make_display_path_with_dir(
         // Display dir differs from canonical — always produce a display path
         let dir_str = display_dir.to_string_lossy();
         let sep = if dir_str.ends_with('/') { "" } else { "/" };
-        Some(PathBuf::from(format!("{}{}{}", dir_str, sep, raw_include_path)))
+        Some(PathBuf::from(format!(
+            "{}{}{}",
+            dir_str, sep, raw_include_path
+        )))
     } else {
         make_display_path(display_dir, raw_include_path)
     }

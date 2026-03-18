@@ -306,8 +306,10 @@ fn replace_digraphs(source: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < source.len() {
         if i + 3 < source.len()
-            && source[i] == b'%' && source[i + 1] == b':'
-            && source[i + 2] == b'%' && source[i + 3] == b':'
+            && source[i] == b'%'
+            && source[i + 1] == b':'
+            && source[i + 2] == b'%'
+            && source[i + 3] == b':'
         {
             result.push(b'#');
             result.push(b'#');

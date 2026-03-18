@@ -14,7 +14,10 @@ pub enum Directive<'a> {
     /// `#embed "path"` or `#embed <path>` (C23, binary resource embedding)
     Embed(IncludeDirective<'a>),
     /// `#define MACRO ...`
-    Define { name: &'a str, value: Option<&'a str> },
+    Define {
+        name: &'a str,
+        value: Option<&'a str>,
+    },
     /// `#undef MACRO`
     Undef { name: &'a str },
     /// `#ifdef MACRO`
@@ -88,36 +91,30 @@ pub fn parse_directive(line: &str) -> Option<Directive<'_>> {
         let value = if name_end < rest.len() {
             let raw = &rest[name_end..];
             let trimmed = raw.trim_end();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
         } else {
             None
         };
         return Some(Directive::Define { name, value });
     }
     if let Some(rest) = strip_keyword(after_hash, "undef") {
-        return Some(Directive::Undef {
-            name: rest.trim(),
-        });
+        return Some(Directive::Undef { name: rest.trim() });
     }
     if let Some(rest) = strip_keyword(after_hash, "ifndef") {
-        return Some(Directive::Ifndef {
-            name: rest.trim(),
-        });
+        return Some(Directive::Ifndef { name: rest.trim() });
     }
     if let Some(rest) = strip_keyword(after_hash, "ifdef") {
-        return Some(Directive::Ifdef {
-            name: rest.trim(),
-        });
+        return Some(Directive::Ifdef { name: rest.trim() });
     }
     if let Some(rest) = strip_keyword(after_hash, "if") {
-        return Some(Directive::If {
-            expr: rest.trim(),
-        });
+        return Some(Directive::If { expr: rest.trim() });
     }
     if let Some(rest) = strip_keyword(after_hash, "elif") {
-        return Some(Directive::Elif {
-            expr: rest.trim(),
-        });
+        return Some(Directive::Elif { expr: rest.trim() });
     }
     if after_hash.starts_with("else") {
         return Some(Directive::Else);
@@ -141,7 +138,9 @@ pub fn parse_directive(line: &str) -> Option<Directive<'_>> {
         });
     }
 
-    Some(Directive::Unknown { content: after_hash })
+    Some(Directive::Unknown {
+        content: after_hash,
+    })
 }
 
 fn parse_include(rest: &str) -> Directive<'_> {
@@ -235,7 +234,13 @@ mod tests {
     #[test]
     fn test_define() {
         let d = parse_directive("#define FOO 42").unwrap();
-        assert!(matches!(d, Directive::Define { name: "FOO", value: Some(" 42") }));
+        assert!(matches!(
+            d,
+            Directive::Define {
+                name: "FOO",
+                value: Some(" 42")
+            }
+        ));
     }
 
     #[test]
@@ -244,7 +249,12 @@ mod tests {
         assert!(matches!(d1, Directive::Ifdef { name: "FOO" }));
 
         let d2 = parse_directive("#if defined(FOO)").unwrap();
-        assert!(matches!(d2, Directive::If { expr: "defined(FOO)" }));
+        assert!(matches!(
+            d2,
+            Directive::If {
+                expr: "defined(FOO)"
+            }
+        ));
     }
 
     #[test]

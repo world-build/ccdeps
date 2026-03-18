@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(test_project C)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_executable(main src/main.c src/util.c)
+target_include_directories(main PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(main PRIVATE USE_FEATURE=1)

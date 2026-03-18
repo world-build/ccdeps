@@ -13,9 +13,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub enum MacroDef {
     /// `#define FOO` or `#define FOO value`
-    ObjectLike {
-        value: Option<String>,
-    },
+    ObjectLike { value: Option<String> },
     /// `#define FOO(a, b) a + b`
     FunctionLike {
         params: Vec<String>,
@@ -28,7 +26,7 @@ pub enum MacroDef {
 }
 
 /// Tracks defined macros for conditional evaluation and expansion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MacroTable {
     macros: HashMap<String, MacroDef>,
     counter: u32,
@@ -156,8 +154,12 @@ impl MacroTable {
         if let Some(idx) = self.macro_stack.iter().rposition(|(n, _)| n == name) {
             let (_, saved) = self.macro_stack.remove(idx);
             match saved {
-                Some(def) => { self.macros.insert(name.to_string(), def); }
-                None => { self.macros.remove(name); }
+                Some(def) => {
+                    self.macros.insert(name.to_string(), def);
+                }
+                None => {
+                    self.macros.remove(name);
+                }
             }
         }
     }
@@ -177,12 +179,7 @@ impl MacroTable {
         self.expand_inner(input, &mut disabled, 0)
     }
 
-    fn expand_inner(
-        &mut self,
-        input: &str,
-        disabled: &mut HashSet<String>,
-        depth: u32,
-    ) -> String {
+    fn expand_inner(&mut self, input: &str, disabled: &mut HashSet<String>, depth: u32) -> String {
         if depth > 64 || input.is_empty() {
             return input.to_string();
         }
@@ -236,9 +233,7 @@ impl MacroTable {
             // Identifier
             if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let ident = &input[start..i];
@@ -332,7 +327,9 @@ impl MacroTable {
                 // Look up macro
                 let def = self.macros.get(ident).cloned();
                 match def {
-                    Some(MacroDef::ObjectLike { value: Some(ref val) }) => {
+                    Some(MacroDef::ObjectLike {
+                        value: Some(ref val),
+                    }) => {
                         disabled.insert(ident.to_string());
                         let expanded = self.expand_inner(val, disabled, depth + 1);
                         disabled.remove(ident);
@@ -370,12 +367,15 @@ impl MacroTable {
                                 .map(|a| self.expand_inner(a, disabled, depth + 1))
                                 .collect();
                             let expanded = substitute_args(
-                                &body, &params, &raw_args, &expanded_args,
-                                is_variadic, variadic_name.as_deref(),
+                                &body,
+                                &params,
+                                &raw_args,
+                                &expanded_args,
+                                is_variadic,
+                                variadic_name.as_deref(),
                             );
                             disabled.insert(ident.to_string());
-                            let re_expanded =
-                                self.expand_inner(&expanded, disabled, depth + 1);
+                            let re_expanded = self.expand_inner(&expanded, disabled, depth + 1);
                             disabled.remove(ident);
                             result.push_str(&re_expanded);
                         } else {
@@ -397,12 +397,6 @@ impl MacroTable {
         }
 
         result
-    }
-}
-
-impl Default for MacroTable {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -513,17 +507,15 @@ fn substitute_args(
                 i += 1;
             }
             // Get the next token and paste it
-            if i < bytes.len()
-                && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
-            {
+            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let token = &body[start..i];
-                if let Some(arg_val) = lookup_param(token, params, raw_args, is_variadic, variadic_name) {
+                if let Some(arg_val) =
+                    lookup_param(token, params, raw_args, is_variadic, variadic_name)
+                {
                     result.push_str(&arg_val);
                 } else {
                     result.push_str(token);
@@ -539,17 +531,15 @@ fn substitute_args(
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            if i < bytes.len()
-                && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
-            {
+            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let token = &body[start..i];
-                if let Some(arg_val) = lookup_param(token, params, raw_args, is_variadic, variadic_name) {
+                if let Some(arg_val) =
+                    lookup_param(token, params, raw_args, is_variadic, variadic_name)
+                {
                     result.push('"');
                     for ch in arg_val.chars() {
                         if ch == '"' || ch == '\\' {
@@ -571,13 +561,13 @@ fn substitute_args(
         // Identifier — check if it's a parameter. Uses EXPANDED args.
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             let token = &body[start..i];
-            if let Some(arg_val) = lookup_param(token, params, expanded_args, is_variadic, variadic_name) {
+            if let Some(arg_val) =
+                lookup_param(token, params, expanded_args, is_variadic, variadic_name)
+            {
                 result.push_str(&arg_val);
             } else {
                 result.push_str(token);
@@ -791,7 +781,10 @@ mod tests {
         t.define("INC", Some("pp-record.h"));
         let result = t.expand("STRINGIZE(INC)");
         // Should produce "pp-record.h" (a string literal containing the filename)
-        assert_eq!(result, "\"pp-record.h\"", "stringize chain should produce quoted string");
+        assert_eq!(
+            result, "\"pp-record.h\"",
+            "stringize chain should produce quoted string"
+        );
     }
 
     #[test]
