@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cppscan::{DepMode, OutputOptions, ScanOptions, Scanner};
-use std::path::PathBuf;
 use std::io::BufRead;
+use std::path::PathBuf;
+use std::process::Command;
 
 /// High-performance C preprocessor dependency scanner.
 ///
@@ -84,11 +85,12 @@ struct Args {
     #[arg(long = "trigraphs")]
     trigraphs: bool,
 
-    /// Predefine platform/compiler macros matching the host gcc (__GNUC__,
-    /// __linux__, __x86_64__, etc.). Enables correct conditional evaluation
-    /// for code that relies on compiler built-in defines.
-    #[arg(long = "gcc-builtins")]
-    gcc_builtins: bool,
+    /// Query a compiler for its predefined macros and use them during scanning.
+    /// Runs `COMPILER -dM -E - < /dev/null` to extract built-in defines like
+    /// __GNUC__, __linux__, __x86_64__, etc. Defaults to "cc" if no compiler
+    /// is specified.
+    #[arg(long = "compiler-macros", value_name = "COMPILER", num_args = 0..=1, default_missing_value = "cc")]
+    compiler_macros: Option<String>,
 }
 
 /// Expand `@file` response file arguments into the argument list.
@@ -120,89 +122,44 @@ fn expand_response_files(args: impl Iterator<Item = String>) -> Vec<String> {
     result
 }
 
-/// Return predefined macros that mimic GCC's built-in defines for the host platform.
-fn gcc_builtin_defines() -> Vec<(String, Option<String>)> {
-    let mut defs: Vec<(&str, Option<&str>)> = Vec::new();
+/// Query a compiler for its predefined macros by running `compiler -dM -E - < /dev/null`.
+/// Parses lines of the form `#define NAME` or `#define NAME VALUE`.
+fn query_compiler_defines(compiler: &str) -> Result<Vec<(String, Option<String>)>> {
+    let output = Command::new(compiler)
+        .args(["-dM", "-E", "-"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run '{compiler} -dM -E -'"))?;
 
-    // Compiler identity
-    defs.push(("__GNUC__", Some("15")));
-    defs.push(("__GNUC_MINOR__", Some("0")));
-    defs.push(("__GNUC_PATCHLEVEL__", Some("0")));
-
-    // Language standard
-    defs.push(("__STDC__", Some("1")));
-    defs.push(("__STDC_VERSION__", Some("201710L")));
-
-    // ELF
-    defs.push(("__ELF__", Some("1")));
-
-    // Character width
-    defs.push(("__CHAR_BIT__", Some("8")));
-
-    // Architecture
-    #[cfg(target_arch = "x86_64")]
-    {
-        defs.push(("__x86_64__", Some("1")));
-        defs.push(("__x86_64", Some("1")));
-        defs.push(("__amd64__", Some("1")));
-        defs.push(("__amd64", Some("1")));
-        defs.push(("__LP64__", Some("1")));
-        defs.push(("_LP64", Some("1")));
-        defs.push(("__SIZEOF_LONG__", Some("8")));
-        defs.push(("__SIZEOF_POINTER__", Some("8")));
-        defs.push(("__SIZEOF_INT__", Some("4")));
-        defs.push(("__SIZEOF_SHORT__", Some("2")));
-        defs.push(("__SIZEOF_LONG_LONG__", Some("8")));
-        defs.push(("__BYTE_ORDER__", Some("1234")));
-        defs.push(("__ORDER_LITTLE_ENDIAN__", Some("1234")));
-        defs.push(("__ORDER_BIG_ENDIAN__", Some("4321")));
+    if !output.status.success() {
+        anyhow::bail!(
+            "'{compiler} -dM -E -' exited with status {}",
+            output.status
+        );
     }
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        defs.push(("__aarch64__", Some("1")));
-        defs.push(("__LP64__", Some("1")));
-        defs.push(("_LP64", Some("1")));
-        defs.push(("__SIZEOF_LONG__", Some("8")));
-        defs.push(("__SIZEOF_POINTER__", Some("8")));
-        defs.push(("__SIZEOF_INT__", Some("4")));
-        defs.push(("__SIZEOF_SHORT__", Some("2")));
-        defs.push(("__SIZEOF_LONG_LONG__", Some("8")));
-        defs.push(("__BYTE_ORDER__", Some("1234")));
-        defs.push(("__ORDER_LITTLE_ENDIAN__", Some("1234")));
-        defs.push(("__ORDER_BIG_ENDIAN__", Some("4321")));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut defines = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        // Parse "#define NAME" or "#define NAME VALUE"
+        if let Some(rest) = line.strip_prefix("#define ") {
+            if let Some((name, value)) = rest.split_once(' ') {
+                // Skip function-like macros (e.g. "#define __has_builtin(x) ...")
+                // since our macro table only supports simple -D style defines
+                if name.contains('(') {
+                    continue;
+                }
+                defines.push((name.to_string(), Some(value.to_string())));
+            } else {
+                defines.push((rest.to_string(), None));
+            }
+        }
     }
 
-    // OS
-    #[cfg(target_os = "linux")]
-    {
-        defs.push(("__linux__", Some("1")));
-        defs.push(("__linux", Some("1")));
-        defs.push(("linux", Some("1")));
-        defs.push(("__unix__", Some("1")));
-        defs.push(("__unix", Some("1")));
-        defs.push(("unix", Some("1")));
-        defs.push(("__gnu_linux__", Some("1")));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        defs.push(("__APPLE__", Some("1")));
-        defs.push(("__MACH__", Some("1")));
-        defs.push(("__unix__", Some("1")));
-        defs.push(("__unix", Some("1")));
-    }
-
-    #[cfg(target_os = "freebsd")]
-    {
-        defs.push(("__FreeBSD__", Some("1")));
-        defs.push(("__unix__", Some("1")));
-        defs.push(("__unix", Some("1")));
-    }
-
-    defs.into_iter()
-        .map(|(k, v)| (k.to_string(), v.map(|s| s.to_string())))
-        .collect()
+    Ok(defines)
 }
 
 fn main() -> Result<()> {
@@ -224,9 +181,9 @@ fn main() -> Result<()> {
             .ok();
     }
 
-    // Start with gcc builtins if requested, then layer user -D flags on top
-    let mut defines: Vec<(String, Option<String>)> = if args.gcc_builtins {
-        gcc_builtin_defines()
+    // Start with compiler-queried macros if requested, then layer user -D flags on top
+    let mut defines: Vec<(String, Option<String>)> = if let Some(ref compiler) = args.compiler_macros {
+        query_compiler_defines(compiler)?
     } else {
         Vec::new()
     };
