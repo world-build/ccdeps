@@ -83,6 +83,12 @@ struct Args {
     /// Process trigraphs (off by default, matching modern gcc/clang).
     #[arg(long = "trigraphs")]
     trigraphs: bool,
+
+    /// Predefine platform/compiler macros matching the host gcc (__GNUC__,
+    /// __linux__, __x86_64__, etc.). Enables correct conditional evaluation
+    /// for code that relies on compiler built-in defines.
+    #[arg(long = "gcc-builtins")]
+    gcc_builtins: bool,
 }
 
 /// Expand `@file` response file arguments into the argument list.
@@ -114,6 +120,91 @@ fn expand_response_files(args: impl Iterator<Item = String>) -> Vec<String> {
     result
 }
 
+/// Return predefined macros that mimic GCC's built-in defines for the host platform.
+fn gcc_builtin_defines() -> Vec<(String, Option<String>)> {
+    let mut defs: Vec<(&str, Option<&str>)> = Vec::new();
+
+    // Compiler identity
+    defs.push(("__GNUC__", Some("15")));
+    defs.push(("__GNUC_MINOR__", Some("0")));
+    defs.push(("__GNUC_PATCHLEVEL__", Some("0")));
+
+    // Language standard
+    defs.push(("__STDC__", Some("1")));
+    defs.push(("__STDC_VERSION__", Some("201710L")));
+
+    // ELF
+    defs.push(("__ELF__", Some("1")));
+
+    // Character width
+    defs.push(("__CHAR_BIT__", Some("8")));
+
+    // Architecture
+    #[cfg(target_arch = "x86_64")]
+    {
+        defs.push(("__x86_64__", Some("1")));
+        defs.push(("__x86_64", Some("1")));
+        defs.push(("__amd64__", Some("1")));
+        defs.push(("__amd64", Some("1")));
+        defs.push(("__LP64__", Some("1")));
+        defs.push(("_LP64", Some("1")));
+        defs.push(("__SIZEOF_LONG__", Some("8")));
+        defs.push(("__SIZEOF_POINTER__", Some("8")));
+        defs.push(("__SIZEOF_INT__", Some("4")));
+        defs.push(("__SIZEOF_SHORT__", Some("2")));
+        defs.push(("__SIZEOF_LONG_LONG__", Some("8")));
+        defs.push(("__BYTE_ORDER__", Some("1234")));
+        defs.push(("__ORDER_LITTLE_ENDIAN__", Some("1234")));
+        defs.push(("__ORDER_BIG_ENDIAN__", Some("4321")));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        defs.push(("__aarch64__", Some("1")));
+        defs.push(("__LP64__", Some("1")));
+        defs.push(("_LP64", Some("1")));
+        defs.push(("__SIZEOF_LONG__", Some("8")));
+        defs.push(("__SIZEOF_POINTER__", Some("8")));
+        defs.push(("__SIZEOF_INT__", Some("4")));
+        defs.push(("__SIZEOF_SHORT__", Some("2")));
+        defs.push(("__SIZEOF_LONG_LONG__", Some("8")));
+        defs.push(("__BYTE_ORDER__", Some("1234")));
+        defs.push(("__ORDER_LITTLE_ENDIAN__", Some("1234")));
+        defs.push(("__ORDER_BIG_ENDIAN__", Some("4321")));
+    }
+
+    // OS
+    #[cfg(target_os = "linux")]
+    {
+        defs.push(("__linux__", Some("1")));
+        defs.push(("__linux", Some("1")));
+        defs.push(("linux", Some("1")));
+        defs.push(("__unix__", Some("1")));
+        defs.push(("__unix", Some("1")));
+        defs.push(("unix", Some("1")));
+        defs.push(("__gnu_linux__", Some("1")));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        defs.push(("__APPLE__", Some("1")));
+        defs.push(("__MACH__", Some("1")));
+        defs.push(("__unix__", Some("1")));
+        defs.push(("__unix", Some("1")));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        defs.push(("__FreeBSD__", Some("1")));
+        defs.push(("__unix__", Some("1")));
+        defs.push(("__unix", Some("1")));
+    }
+
+    defs.into_iter()
+        .map(|(k, v)| (k.to_string(), v.map(|s| s.to_string())))
+        .collect()
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -133,18 +224,21 @@ fn main() -> Result<()> {
             .ok();
     }
 
-    // Parse -D flags into (name, optional_value) pairs
-    let mut defines: Vec<(String, Option<String>)> = args
-        .defines
-        .iter()
-        .map(|d| {
-            if let Some((name, value)) = d.split_once('=') {
-                (name.to_string(), Some(value.to_string()))
-            } else {
-                (d.clone(), None)
-            }
-        })
-        .collect();
+    // Start with gcc builtins if requested, then layer user -D flags on top
+    let mut defines: Vec<(String, Option<String>)> = if args.gcc_builtins {
+        gcc_builtin_defines()
+    } else {
+        Vec::new()
+    };
+
+    // Parse -D flags into (name, optional_value) pairs (override builtins)
+    defines.extend(args.defines.iter().map(|d| {
+        if let Some((name, value)) = d.split_once('=') {
+            (name.to_string(), Some(value.to_string()))
+        } else {
+            (d.clone(), None)
+        }
+    }));
 
     // -U flags: remove any -D that conflicts with -U.
     for u in &args.undefines {
