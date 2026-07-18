@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::vfs::Vfs;
+
 /// A resolved include with metadata about where it was found.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedInclude {
@@ -47,10 +49,11 @@ impl SearchPaths {
         path: &str,
         including_file_dir: &Path,
         display_dir: Option<&Path>,
+        vfs: &dyn Vfs,
     ) -> Option<ResolvedInclude> {
         // 1. Current file's directory
         let candidate = including_file_dir.join(path);
-        if candidate.is_file() {
+        if vfs.is_file(&candidate) {
             let display = make_display_path_with_dir(
                 display_dir.unwrap_or(including_file_dir),
                 including_file_dir,
@@ -66,7 +69,7 @@ impl SearchPaths {
         // 2. -iquote paths
         for dir in &self.quote_paths {
             let candidate = dir.join(path);
-            if candidate.is_file() {
+            if vfs.is_file(&candidate) {
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
                     path: candidate,
@@ -77,7 +80,7 @@ impl SearchPaths {
         }
 
         // 3-4. Same as angle bracket
-        self.resolve_angle(path)
+        self.resolve_angle(path, vfs)
     }
 
     /// Resolve an angle-bracket include (`#include <path>`).
@@ -85,10 +88,10 @@ impl SearchPaths {
     /// Search order:
     /// 1. `-I` paths
     /// 2. `-isystem` paths
-    pub fn resolve_angle(&self, path: &str) -> Option<ResolvedInclude> {
+    pub fn resolve_angle(&self, path: &str, vfs: &dyn Vfs) -> Option<ResolvedInclude> {
         for dir in &self.include_paths {
             let candidate = dir.join(path);
-            if candidate.is_file() {
+            if vfs.is_file(&candidate) {
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
                     path: candidate,
@@ -100,7 +103,7 @@ impl SearchPaths {
 
         for dir in &self.system_paths {
             let candidate = dir.join(path);
-            if candidate.is_file() {
+            if vfs.is_file(&candidate) {
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
                     path: candidate,
@@ -117,7 +120,12 @@ impl SearchPaths {
     /// after `found_in_dir` in the search path order.
     ///
     /// This is a GNU extension used heavily in system headers (e.g., glibc wrappers).
-    pub fn resolve_include_next(&self, path: &str, found_in_dir: &Path) -> Option<ResolvedInclude> {
+    pub fn resolve_include_next(
+        &self,
+        path: &str,
+        found_in_dir: &Path,
+        vfs: &dyn Vfs,
+    ) -> Option<ResolvedInclude> {
         let all_paths = self
             .quote_paths
             .iter()
@@ -133,7 +141,7 @@ impl SearchPaths {
                 continue;
             }
             let candidate = dir.join(path);
-            if candidate.is_file() {
+            if vfs.is_file(&candidate) {
                 let is_system = self.system_paths.iter().any(|sp| sp == dir);
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
@@ -193,6 +201,7 @@ fn make_display_path_with_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::OsVfs;
     use std::fs;
 
     #[test]
@@ -202,7 +211,7 @@ mod tests {
         fs::write(&header, "// foo").unwrap();
 
         let paths = SearchPaths::default();
-        let result = paths.resolve_quoted("foo.h", dir.path(), None);
+        let result = paths.resolve_quoted("foo.h", dir.path(), None, &OsVfs);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.path, header);
@@ -219,7 +228,7 @@ mod tests {
             include_paths: vec![dir.path().to_path_buf()],
             ..Default::default()
         };
-        let result = paths.resolve_angle("bar.h");
+        let result = paths.resolve_angle("bar.h", &OsVfs);
         let r = result.unwrap();
         assert_eq!(r.path, header);
         assert!(!r.is_system);
@@ -235,7 +244,7 @@ mod tests {
             system_paths: vec![dir.path().to_path_buf()],
             ..Default::default()
         };
-        let result = paths.resolve_angle("sys.h");
+        let result = paths.resolve_angle("sys.h", &OsVfs);
         let r = result.unwrap();
         assert_eq!(r.path, header);
         assert!(r.is_system);
@@ -244,6 +253,6 @@ mod tests {
     #[test]
     fn test_resolve_not_found() {
         let paths = SearchPaths::default();
-        assert_eq!(paths.resolve_angle("nonexistent.h"), None);
+        assert_eq!(paths.resolve_angle("nonexistent.h", &OsVfs), None);
     }
 }

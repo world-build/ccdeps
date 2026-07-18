@@ -17,11 +17,7 @@ use crate::intern::PathInterner;
 use crate::macros::MacroTable;
 use crate::minimize::{self, MinimizeOptions};
 use crate::resolve::{ResolvedInclude, SearchPaths};
-
-/// Files at or above this size use memory-mapped I/O. Below this threshold,
-/// a plain `read` is faster because mmap has fixed per-call overhead (~2 µs
-/// for the VMA setup + page fault) that dominates for tiny files.
-const MMAP_THRESHOLD: u64 = 4096;
+use crate::vfs::Vfs;
 
 /// Cached information about a scanned file.
 #[derive(Debug)]
@@ -67,6 +63,7 @@ pub fn new_file_cache() -> FileCache {
 /// `initial_defines` provides command-line `-D` definitions.
 pub fn collect_deps(
     source_path: &Path,
+    vfs: &dyn Vfs,
     search_paths: &SearchPaths,
     cache: &FileCache,
     initial_defines: &[(String, Option<String>)],
@@ -86,11 +83,12 @@ pub fn collect_deps(
         macros.define(name, value.as_deref());
     }
 
-    let canonical = std::fs::canonicalize(source_path)?;
+    let canonical = vfs.canonicalize(source_path)?;
     visited.insert(canonical.clone());
 
     collect_deps_recursive(
         &canonical,
+        vfs,
         search_paths,
         cache,
         &mut deps,
@@ -177,6 +175,7 @@ impl ConditionalStack {
 #[allow(clippy::too_many_arguments)]
 fn collect_deps_recursive(
     file_path: &Path,
+    vfs: &dyn Vfs,
     search_paths: &SearchPaths,
     cache: &FileCache,
     deps: &mut Vec<DepEntry>,
@@ -189,7 +188,7 @@ fn collect_deps_recursive(
     mut is_system_header: bool,
     display_dir: Option<&Path>,
 ) -> Result<(), std::io::Error> {
-    let info = get_or_scan(file_path, cache, minimize_opts)?;
+    let info = get_or_scan(file_path, vfs, cache, minimize_opts)?;
 
     let content = String::from_utf8_lossy(&info.minimized.content);
     let mut cond_stack = ConditionalStack::new();
@@ -197,6 +196,7 @@ fn collect_deps_recursive(
     let eval_ctx = eval::EvalContext {
         search_paths,
         current_file_dir: current_dir,
+        vfs,
     };
 
     for line in content.lines() {
@@ -292,6 +292,7 @@ fn collect_deps_recursive(
                 handle_include(
                     inc,
                     file_path,
+                    vfs,
                     search_paths,
                     cache,
                     deps,
@@ -308,7 +309,7 @@ fn collect_deps_recursive(
             }
             Directive::IncludeNext(ref inc) => {
                 // #include_next: resolve starting from the next search directory
-                let resolved = search_paths.resolve_include_next(inc.path, current_dir);
+                let resolved = search_paths.resolve_include_next(inc.path, current_dir, vfs);
                 if let Some(ResolvedInclude {
                     path: resolved_path,
                     is_system,
@@ -319,6 +320,7 @@ fn collect_deps_recursive(
                         &resolved_path,
                         is_system || is_system_header,
                         display_path,
+                        vfs,
                         search_paths,
                         cache,
                         deps,
@@ -338,6 +340,7 @@ fn collect_deps_recursive(
                 handle_include(
                     inc,
                     file_path,
+                    vfs,
                     search_paths,
                     cache,
                     deps,
@@ -358,19 +361,19 @@ fn collect_deps_recursive(
                 let resolved = match inc.style {
                     IncludeStyle::Quoted => {
                         let dir = file_path.parent().unwrap_or(Path::new("."));
-                        search_paths.resolve_quoted(inc.path, dir, display_dir)
+                        search_paths.resolve_quoted(inc.path, dir, display_dir, vfs)
                     }
-                    IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
+                    IncludeStyle::Angle => search_paths.resolve_angle(inc.path, vfs),
                     IncludeStyle::Computed => {
                         let expanded = macros.expand(inc.path);
                         let expanded = expanded.trim().to_string();
                         if let Some(path) = extract_include_path(&expanded) {
                             let is_angle = expanded.starts_with('<');
                             if is_angle {
-                                search_paths.resolve_angle(&path)
+                                search_paths.resolve_angle(&path, vfs)
                             } else {
                                 let dir = file_path.parent().unwrap_or(Path::new("."));
-                                search_paths.resolve_quoted(&path, dir, display_dir)
+                                search_paths.resolve_quoted(&path, dir, display_dir, vfs)
                             }
                         } else {
                             None
@@ -383,7 +386,7 @@ fn collect_deps_recursive(
                     display_path: res_display,
                 }) = resolved
                 {
-                    let canonical = match std::fs::canonicalize(&resolved_path) {
+                    let canonical = match vfs.canonicalize(&resolved_path) {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -454,6 +457,7 @@ fn extract_pragma_macro_name(s: &str) -> Option<&str> {
 fn handle_include(
     inc: &IncludeDirective<'_>,
     file_path: &Path,
+    vfs: &dyn Vfs,
     search_paths: &SearchPaths,
     cache: &FileCache,
     deps: &mut Vec<DepEntry>,
@@ -470,19 +474,19 @@ fn handle_include(
     let resolved = match inc.style {
         IncludeStyle::Quoted => {
             let dir = file_path.parent().unwrap_or(Path::new("."));
-            search_paths.resolve_quoted(inc.path, dir, display_dir)
+            search_paths.resolve_quoted(inc.path, dir, display_dir, vfs)
         }
-        IncludeStyle::Angle => search_paths.resolve_angle(inc.path),
+        IncludeStyle::Angle => search_paths.resolve_angle(inc.path, vfs),
         IncludeStyle::Computed => {
             let expanded = macros.expand(inc.path);
             let expanded = expanded.trim().to_string();
             if let Some(path) = extract_include_path(&expanded) {
                 let is_angle = expanded.starts_with('<');
                 if is_angle {
-                    search_paths.resolve_angle(&path)
+                    search_paths.resolve_angle(&path, vfs)
                 } else {
                     let dir = file_path.parent().unwrap_or(Path::new("."));
-                    search_paths.resolve_quoted(&path, dir, display_dir)
+                    search_paths.resolve_quoted(&path, dir, display_dir, vfs)
                 }
             } else {
                 return Ok(());
@@ -500,6 +504,7 @@ fn handle_include(
             &resolved_path,
             is_system || is_system_header,
             display_path,
+            vfs,
             search_paths,
             cache,
             deps,
@@ -524,6 +529,7 @@ fn process_resolved_include(
     resolved_path: &Path,
     is_system: bool,
     resolved_display: Option<PathBuf>,
+    vfs: &dyn Vfs,
     search_paths: &SearchPaths,
     cache: &FileCache,
     deps: &mut Vec<DepEntry>,
@@ -535,7 +541,7 @@ fn process_resolved_include(
     minimize_opts: &MinimizeOptions,
     is_import: bool,
 ) -> Result<(), std::io::Error> {
-    let canonical = match std::fs::canonicalize(resolved_path) {
+    let canonical = match vfs.canonicalize(resolved_path) {
         Ok(c) => c,
         Err(_) => return Ok(()),
     };
@@ -617,6 +623,7 @@ fn process_resolved_include(
 
     collect_deps_recursive(
         &canonical,
+        vfs,
         search_paths,
         cache,
         deps,
@@ -661,11 +668,13 @@ fn extract_include_path(expanded: &str) -> Option<String> {
 
 /// Get file info from cache, or scan and cache it.
 ///
-/// Uses memory-mapped I/O for files >= 4 KB (avoids the allocation + copy of
+/// File contents are read through the [`Vfs`], which for the real filesystem
+/// uses memory-mapped I/O for files >= 4 KB (avoids the allocation of
 /// `std::fs::read`) and plain `read` for smaller files (avoids mmap's fixed
 /// VMA setup overhead).
 fn get_or_scan(
     path: &Path,
+    vfs: &dyn Vfs,
     cache: &FileCache,
     minimize_opts: &MinimizeOptions,
 ) -> Result<Arc<FileInfo>, std::io::Error> {
@@ -673,27 +682,12 @@ fn get_or_scan(
         return Ok(Arc::clone(&info));
     }
 
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    let file_size = metadata.len();
-
-    let minimized = if file_size >= MMAP_THRESHOLD {
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-        #[cfg(unix)]
-        {
-            mmap.advise(memmap2::Advice::Sequential).ok();
-        }
-
-        minimize::minimize_with_options(&mmap, minimize_opts)
-    } else {
-        let source = std::fs::read(path)?;
-        minimize::minimize_with_options(&source, minimize_opts)
-    };
+    let source = vfs.read(path)?;
+    let minimized = minimize::minimize_with_options(&source, minimize_opts);
 
     let info = Arc::new(FileInfo {
         minimized,
-        original_size: file_size as usize,
+        original_size: source.len(),
     });
 
     cache.insert(path.to_path_buf(), Arc::clone(&info));
@@ -703,6 +697,7 @@ fn get_or_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::OsVfs;
     use std::fs;
 
     #[test]
@@ -719,6 +714,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("a.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -749,6 +745,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -779,6 +776,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -810,6 +808,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -841,6 +840,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -873,6 +873,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -905,6 +906,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -937,6 +939,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &defines,
@@ -968,6 +971,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -998,6 +1002,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -1027,6 +1032,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -1057,6 +1063,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],
@@ -1088,6 +1095,7 @@ mod tests {
 
         let deps = collect_deps(
             &dir.path().join("main.c"),
+            &OsVfs,
             &search_paths,
             &cache,
             &[],

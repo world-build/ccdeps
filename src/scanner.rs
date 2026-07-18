@@ -4,10 +4,12 @@
 
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::depgraph::{self, DepEntry, FileCache};
 use crate::output::{self, OutputOptions};
 use crate::resolve::SearchPaths;
+use crate::vfs::{OsVfs, Vfs};
 
 /// Dependency output mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,17 +74,32 @@ pub struct ScanResult {
 }
 
 /// The main dependency scanner.
-#[derive(Debug)]
 pub struct Scanner {
     options: ScanOptions,
     cache: FileCache,
+    vfs: Arc<dyn Vfs>,
+}
+
+impl std::fmt::Debug for Scanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scanner")
+            .field("options", &self.options)
+            .field("cache", &self.cache)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Scanner {
     pub fn new(options: ScanOptions) -> Self {
+        Self::with_vfs(options, Arc::new(OsVfs))
+    }
+
+    /// Create a scanner that performs all file access through the given [`Vfs`].
+    pub fn with_vfs(options: ScanOptions, vfs: Arc<dyn Vfs>) -> Self {
         Self {
             options,
             cache: depgraph::new_file_cache(),
+            vfs,
         }
     }
 
@@ -94,6 +111,7 @@ impl Scanner {
         };
         let deps = depgraph::collect_deps(
             source,
+            &*self.vfs,
             &self.options.search_paths,
             &self.cache,
             &self.options.defines,
@@ -170,6 +188,7 @@ impl Scanner {
         };
         let deps = depgraph::collect_deps(
             source,
+            &*self.vfs,
             &options.search_paths,
             &self.cache,
             &options.defines,

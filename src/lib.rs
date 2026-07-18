@@ -46,7 +46,9 @@ pub mod minimize;
 pub mod output;
 pub mod resolve;
 pub mod scanner;
+pub mod vfs;
 
 pub use depgraph::{DepCollectOptions, DepEntry};
 pub use output::OutputOptions;
 pub use scanner::{DepMode, ScanOptions, ScanResult, Scanner};
+pub use vfs::{OsVfs, Vfs};

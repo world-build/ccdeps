@@ -9,11 +9,13 @@ use std::path::Path;
 
 use crate::macros::MacroTable;
 use crate::resolve::SearchPaths;
+use crate::vfs::Vfs;
 
 /// Context for evaluating `__has_include` in `#if` expressions.
 pub struct EvalContext<'a> {
     pub search_paths: &'a SearchPaths,
     pub current_file_dir: &'a Path,
+    pub vfs: &'a dyn Vfs,
 }
 
 /// Evaluate a `#if` expression string to an `i64`.
@@ -115,10 +117,10 @@ fn resolve_has_include(
                             // Resolve the include
                             let found = if let Some(ctx) = ctx {
                                 if delim == b'<' {
-                                    ctx.search_paths.resolve_angle(path).is_some()
+                                    ctx.search_paths.resolve_angle(path, ctx.vfs).is_some()
                                 } else {
                                     ctx.search_paths
-                                        .resolve_quoted(path, ctx.current_file_dir, None)
+                                        .resolve_quoted(path, ctx.current_file_dir, None, ctx.vfs)
                                         .is_some()
                                 }
                             } else {
@@ -157,14 +159,14 @@ fn resolve_has_include(
                         {
                             let path = &expanded_arg[1..expanded_arg.len() - 1];
                             ctx.search_paths
-                                .resolve_quoted(path, ctx.current_file_dir, None)
+                                .resolve_quoted(path, ctx.current_file_dir, None, ctx.vfs)
                                 .is_some()
                         } else if expanded_arg.starts_with('<')
                             && expanded_arg.ends_with('>')
                             && expanded_arg.len() >= 2
                         {
                             let path = &expanded_arg[1..expanded_arg.len() - 1];
-                            ctx.search_paths.resolve_angle(path).is_some()
+                            ctx.search_paths.resolve_angle(path, ctx.vfs).is_some()
                         } else {
                             false
                         }
@@ -912,6 +914,7 @@ mod tests {
         let ctx = EvalContext {
             search_paths: &search_paths,
             current_file_dir: dir.path(),
+            vfs: &crate::vfs::OsVfs,
         };
         let mut m = MacroTable::new();
         assert_eq!(
@@ -936,6 +939,7 @@ mod tests {
         let ctx = EvalContext {
             search_paths: &search_paths,
             current_file_dir: dir.path(),
+            vfs: &crate::vfs::OsVfs,
         };
         let mut m = MacroTable::new();
         assert_eq!(
@@ -957,6 +961,7 @@ mod tests {
         let ctx = EvalContext {
             search_paths: &search_paths,
             current_file_dir: dir.path(),
+            vfs: &crate::vfs::OsVfs,
         };
         let mut m = MacroTable::new();
         assert_eq!(
