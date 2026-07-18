@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::directive::{self, Directive, IncludeDirective, IncludeStyle};
-use crate::eval;
+use crate::eval::{self, Cond};
 use crate::intern::PathInterner;
-use crate::macros::MacroTable;
+use crate::macros::{MacroState, MacroTable};
 use crate::minimize::{self, MinimizeOptions};
 use crate::resolve::{ResolvedInclude, SearchPaths};
 use crate::vfs::Vfs;
@@ -38,6 +38,10 @@ pub struct DepEntry {
     pub display_path: Option<PathBuf>,
     /// Whether this dependency was found via a system include path (`-isystem`).
     pub is_system: bool,
+    /// `Some(style)` for unresolved headers recorded via the `-MG` missing
+    /// path (post-expansion style for computed includes); `None` for every
+    /// resolved dependency.
+    pub missing_style: Option<crate::directive::IncludeStyle>,
 }
 
 /// Thread-safe cache of scanned files.
@@ -50,6 +54,10 @@ pub struct DepCollectOptions {
     pub missing_as_generated: bool,
     /// Process trigraphs in source files.
     pub trigraphs: bool,
+    /// Conservative mode: conditionals on unknown macros (names the compiler
+    /// might predefine, or names defined/undefined in maybe-taken branches)
+    /// follow BOTH branches, producing a sound superset of the include set.
+    pub conservative: bool,
 }
 
 /// Create a new empty file cache.
@@ -110,13 +118,23 @@ pub fn collect_deps(
 // ---------------------------------------------------------------------------
 
 /// State for one level of `#if`/`#ifdef`/`#ifndef` nesting.
+///
+/// In exact mode conditions are never [`Cond::Unknown`], so `active` follows
+/// exactly one branch per chain, reproducing the historical behavior. In
+/// conservative mode an Unknown condition leaves a branch active (maybe
+/// taken) without marking it definitely taken, so later branches of the
+/// chain stay active too — both sides contribute dependencies.
 struct ConditionalState {
-    /// Whether any branch in this `#if`/`#elif`/`#else` chain has been taken.
-    any_branch_taken: bool,
-    /// Whether the current branch is active (should process directives).
+    /// A branch in this chain has DEFINITELY been taken (True condition).
+    definitely_taken: bool,
+    /// All conditions seen so far in this chain were definitely False.
+    all_prior_false: bool,
+    /// Current branch should be processed (may = maybe-taken).
     active: bool,
-    /// Whether the enclosing scope was active.
+    /// Current branch is CERTAINLY the one real compilation takes.
+    certain: bool,
     parent_active: bool,
+    parent_certain: bool,
 }
 
 struct ConditionalStack {
@@ -133,33 +151,46 @@ impl ConditionalStack {
         self.stack.last().is_none_or(|s| s.active)
     }
 
-    fn push_if(&mut self, condition: bool) {
+    /// Whether every enclosing branch is certainly the one real compilation
+    /// takes (true at the top level).
+    fn is_certain(&self) -> bool {
+        self.stack.last().is_none_or(|s| s.certain)
+    }
+
+    fn push_if(&mut self, condition: Cond) {
         let parent_active = self.is_active();
-        let active = parent_active && condition;
+        let parent_certain = self.is_certain();
+        let active = parent_active && condition != Cond::False;
         self.stack.push(ConditionalState {
-            any_branch_taken: active,
+            definitely_taken: parent_active && condition == Cond::True,
+            all_prior_false: condition == Cond::False,
             active,
+            certain: parent_certain && condition == Cond::True,
             parent_active,
+            parent_certain,
         });
     }
 
-    fn handle_elif(&mut self, condition: bool) {
+    fn handle_elif(&mut self, condition: Cond) {
         if let Some(state) = self.stack.last_mut() {
-            if state.any_branch_taken || !state.parent_active {
+            if state.definitely_taken || !state.parent_active {
                 state.active = false;
-            } else if condition {
-                state.active = true;
-                state.any_branch_taken = true;
+                state.certain = false;
             } else {
-                state.active = false;
+                state.active = condition != Cond::False;
+                state.certain =
+                    state.parent_certain && state.all_prior_false && condition == Cond::True;
+                state.definitely_taken |= condition == Cond::True;
+                state.all_prior_false &= condition == Cond::False;
             }
         }
     }
 
     fn handle_else(&mut self) {
         if let Some(state) = self.stack.last_mut() {
-            state.active = state.parent_active && !state.any_branch_taken;
-            state.any_branch_taken = true;
+            state.active = state.parent_active && !state.definitely_taken;
+            state.certain = state.parent_certain && state.all_prior_false;
+            state.definitely_taken = true;
         }
     }
 
@@ -224,33 +255,50 @@ fn collect_deps_recursive(
         match directive {
             Directive::If { expr } => {
                 let condition = if cond_stack.is_active() {
-                    eval::evaluate_with_context(expr, macros, &eval_ctx) != 0
+                    eval::evaluate_cond(expr, macros, &eval_ctx, options.conservative)
                 } else {
-                    false
+                    Cond::False
                 };
                 cond_stack.push_if(condition);
                 continue;
             }
             Directive::Ifdef { name } => {
                 let condition = if cond_stack.is_active() {
-                    macros.is_defined(name)
+                    match macros.state_of(name, options.conservative) {
+                        MacroState::Defined => Cond::True,
+                        MacroState::Undefined => Cond::False,
+                        MacroState::Unknown => Cond::Unknown,
+                    }
                 } else {
-                    false
+                    Cond::False
                 };
                 cond_stack.push_if(condition);
                 continue;
             }
             Directive::Ifndef { name } => {
                 let condition = if cond_stack.is_active() {
-                    !macros.is_defined(name)
+                    match macros.state_of(name, options.conservative) {
+                        MacroState::Defined => Cond::False,
+                        MacroState::Undefined => Cond::True,
+                        // Own-guard rule: a header's own include guard is
+                        // assumed not to be a compiler predef — treat the
+                        // guard branch as certainly taken so the `#define`s
+                        // in its body stay tracked.
+                        MacroState::Unknown
+                            if info.minimized.guard_macro.as_deref() == Some(name) =>
+                        {
+                            Cond::True
+                        }
+                        MacroState::Unknown => Cond::Unknown,
+                    }
                 } else {
-                    false
+                    Cond::False
                 };
                 cond_stack.push_if(condition);
                 continue;
             }
             Directive::Elif { expr } => {
-                let condition = eval::evaluate_with_context(expr, macros, &eval_ctx) != 0;
+                let condition = eval::evaluate_cond(expr, macros, &eval_ctx, options.conservative);
                 cond_stack.handle_elif(condition);
                 continue;
             }
@@ -272,7 +320,11 @@ fn collect_deps_recursive(
 
         match directive {
             Directive::Define { name, value } => {
-                if let Some(val) = value {
+                if options.conservative && !cond_stack.is_certain() {
+                    // Defined inside a branch we're not sure is taken: the
+                    // macro's real state now depends on that branch.
+                    macros.mark_unknown(name);
+                } else if let Some(val) = value {
                     if val.starts_with('(') {
                         macros.define_function_like(name, val);
                     } else {
@@ -283,7 +335,11 @@ fn collect_deps_recursive(
                 }
             }
             Directive::Undef { name } => {
-                macros.undef(name);
+                if options.conservative && !cond_stack.is_certain() {
+                    macros.mark_unknown(name);
+                } else {
+                    macros.undef(name);
+                }
             }
             Directive::Pragma { tokens } => {
                 handle_pragma(tokens, macros, &mut is_system_header);
@@ -333,7 +389,7 @@ fn collect_deps_recursive(
                         false,
                     )?;
                 } else if options.missing_as_generated {
-                    add_missing_dep(inc.path, deps, interner);
+                    add_missing_dep(inc.path, inc.style, deps, interner);
                 }
             }
             Directive::Import(ref inc) => {
@@ -358,6 +414,7 @@ fn collect_deps_recursive(
             Directive::Embed(ref inc) => {
                 // #embed is like #include for dependency purposes — resolve and add
                 // to deps, but don't recurse (it embeds binary data, not source).
+                let mut missing_style = inc.style;
                 let resolved = match inc.style {
                     IncludeStyle::Quoted => {
                         let dir = file_path.parent().unwrap_or(Path::new("."));
@@ -369,6 +426,11 @@ fn collect_deps_recursive(
                         let expanded = expanded.trim().to_string();
                         if let Some(path) = extract_include_path(&expanded) {
                             let is_angle = expanded.starts_with('<');
+                            missing_style = if is_angle {
+                                IncludeStyle::Angle
+                            } else {
+                                IncludeStyle::Quoted
+                            };
                             if is_angle {
                                 search_paths.resolve_angle(&path, vfs)
                             } else {
@@ -403,10 +465,11 @@ fn collect_deps_recursive(
                             path: interned_path,
                             display_path,
                             is_system: is_system || is_system_header,
+                            missing_style: None,
                         });
                     }
                 } else if options.missing_as_generated {
-                    add_missing_dep(inc.path, deps, interner);
+                    add_missing_dep(inc.path, missing_style, deps, interner);
                 }
             }
             _ => {}
@@ -471,6 +534,7 @@ fn handle_include(
     is_import: bool,
     display_dir: Option<&Path>,
 ) -> Result<(), std::io::Error> {
+    let mut missing_style = inc.style;
     let resolved = match inc.style {
         IncludeStyle::Quoted => {
             let dir = file_path.parent().unwrap_or(Path::new("."));
@@ -482,6 +546,11 @@ fn handle_include(
             let expanded = expanded.trim().to_string();
             if let Some(path) = extract_include_path(&expanded) {
                 let is_angle = expanded.starts_with('<');
+                missing_style = if is_angle {
+                    IncludeStyle::Angle
+                } else {
+                    IncludeStyle::Quoted
+                };
                 if is_angle {
                     search_paths.resolve_angle(&path, vfs)
                 } else {
@@ -517,7 +586,7 @@ fn handle_include(
             is_import,
         )?;
     } else if options.missing_as_generated {
-        add_missing_dep(inc.path, deps, interner);
+        add_missing_dep(inc.path, missing_style, deps, interner);
     }
 
     Ok(())
@@ -564,6 +633,7 @@ fn process_resolved_include(
                 path: interned,
                 display_path: display_path.clone(),
                 is_system,
+                missing_style: None,
             });
         }
         return Ok(());
@@ -594,6 +664,7 @@ fn process_resolved_include(
                     path: interned,
                     display_path: display_path.clone(),
                     is_system,
+                    missing_style: None,
                 });
             }
             return Ok(());
@@ -612,6 +683,7 @@ fn process_resolved_include(
         path: interned,
         display_path: display_path.clone(),
         is_system,
+        missing_style: None,
     });
 
     // Compute the "apparent directory" for this file based on its display path.
@@ -641,7 +713,15 @@ fn process_resolved_include(
 }
 
 /// Add a missing header as a generated dependency (`-MG`).
-fn add_missing_dep(path: &str, deps: &mut Vec<DepEntry>, interner: &PathInterner) {
+///
+/// `style` records how the header was requested (post-expansion style for
+/// computed includes, or `Computed` when the expansion was undeterminable).
+fn add_missing_dep(
+    path: &str,
+    style: IncludeStyle,
+    deps: &mut Vec<DepEntry>,
+    interner: &PathInterner,
+) {
     let p = Path::new(path);
     let interned = interner.intern(p);
     if !deps.iter().any(|d| *d.path == *interned) {
@@ -649,6 +729,7 @@ fn add_missing_dep(path: &str, deps: &mut Vec<DepEntry>, interner: &PathInterner
             path: interned,
             display_path: None,
             is_system: false,
+            missing_style: Some(style),
         });
     }
 }
@@ -1108,5 +1189,192 @@ mod tests {
             .collect();
         assert!(names.contains(&"exists.h".to_string()));
         assert!(!names.contains(&"fallback.h".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conservative mode
+    // -----------------------------------------------------------------------
+
+    /// Scan `main.c` in `dir` and return dependency file names.
+    fn scan_names(
+        dir: &Path,
+        defines: &[(String, Option<String>)],
+        conservative: bool,
+    ) -> Vec<String> {
+        let search_paths = SearchPaths::default();
+        let cache = new_file_cache();
+        let options = DepCollectOptions {
+            conservative,
+            ..Default::default()
+        };
+        let deps = collect_deps(
+            &dir.join("main.c"),
+            &OsVfs,
+            &search_paths,
+            &cache,
+            defines,
+            &options,
+        )
+        .unwrap();
+        deps.iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_conservative_ifdef_predef_takes_both_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
+        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#ifdef __linux__\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        let names = scan_names(dir.path(), &[], true);
+        assert!(names.contains(&"yes.h".to_string()));
+        assert!(names.contains(&"no.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_if_defined_predef_takes_both_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("win.h"), "// win\n").unwrap();
+        fs::write(dir.path().join("posix.h"), "// posix\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#if defined(_WIN32)\n#include \"win.h\"\n#else\n#include \"posix.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        let names = scan_names(dir.path(), &[], true);
+        assert!(names.contains(&"win.h".to_string()));
+        assert!(names.contains(&"posix.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_plain_unknown_macro_takes_else_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
+        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#ifdef FOO\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        // FOO is untracked and not predefinable — exact-like behavior.
+        let names = scan_names(dir.path(), &[], true);
+        assert!(!names.contains(&"yes.h".to_string()));
+        assert!(names.contains(&"no.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_cmdline_define_single_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
+        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#ifdef FEATURE\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        let defines = vec![("FEATURE".to_string(), None)];
+        let names = scan_names(dir.path(), &defines, true);
+        assert!(names.contains(&"yes.h".to_string()));
+        assert!(!names.contains(&"no.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_own_guard_keeps_defines_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.h"), "// x\n").unwrap();
+        fs::write(dir.path().join("y.h"), "// y\n").unwrap();
+        fs::write(
+            dir.path().join("g.h"),
+            "#ifndef _G_H\n#define _G_H\n#define HAVE_X 1\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#include \"g.h\"\n#if HAVE_X\n#include \"x.h\"\n#endif\n#if !HAVE_X\n#include \"y.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        // g.h's own guard branch is certain, so HAVE_X stays tracked.
+        let names = scan_names(dir.path(), &[], true);
+        assert!(names.contains(&"x.h".to_string()));
+        assert!(!names.contains(&"y.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_uncertain_define_takes_both_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.h"), "// x\n").unwrap();
+        fs::write(dir.path().join("y.h"), "// y\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#ifdef __FEATURE__\n#define WITH_X 1\n#endif\n#if WITH_X\n#include \"x.h\"\n#else\n#include \"y.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        // WITH_X is defined only inside a maybe-taken branch, so it becomes
+        // Unknown even though the name is not underscore-prefixed.
+        let names = scan_names(dir.path(), &[], true);
+        assert!(names.contains(&"x.h".to_string()));
+        assert!(names.contains(&"y.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_undef_is_known_undefined() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("w.h"), "// w\n").unwrap();
+        fs::write(dir.path().join("u.h"), "// u\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#undef _WIN32\n#ifdef _WIN32\n#include \"w.h\"\n#else\n#include \"u.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        // The tombstone makes _WIN32 known-undefined despite being predefinable.
+        let names = scan_names(dir.path(), &[], true);
+        assert!(!names.contains(&"w.h".to_string()));
+        assert!(names.contains(&"u.h".to_string()));
+    }
+
+    #[test]
+    fn test_conservative_missing_has_include_takes_both_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.h"), "// a\n").unwrap();
+        fs::write(dir.path().join("b.h"), "// b\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#if __has_include(<no/such/header.h>)\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        // The header may exist in compiler-internal search paths → Unknown.
+        let names = scan_names(dir.path(), &[], true);
+        assert!(names.contains(&"a.h".to_string()));
+        assert!(names.contains(&"b.h".to_string()));
+    }
+
+    #[test]
+    fn test_exact_mode_predef_takes_else_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
+        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#ifdef __linux__\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
+        )
+        .unwrap();
+
+        // Default (exact) mode: today's semantics, else branch only.
+        let names = scan_names(dir.path(), &[], false);
+        assert!(!names.contains(&"yes.h".to_string()));
+        assert!(names.contains(&"no.h".to_string()));
     }
 }

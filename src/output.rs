@@ -177,6 +177,7 @@ mod tests {
             path: Arc::from(Path::new(path)),
             display_path: None,
             is_system: false,
+            missing_style: None,
         }
     }
 
@@ -185,6 +186,7 @@ mod tests {
             path: Arc::from(Path::new(path)),
             display_path: None,
             is_system: true,
+            missing_style: None,
         }
     }
 

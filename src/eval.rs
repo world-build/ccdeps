@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::macros::MacroTable;
+use crate::macros::{MacroState, MacroTable};
 use crate::resolve::SearchPaths;
 use crate::vfs::Vfs;
 
@@ -30,6 +30,236 @@ pub fn evaluate(expr: &str, macros: &mut MacroTable) -> i64 {
 /// Evaluate a `#if` expression with context for `__has_include`.
 pub fn evaluate_with_context(expr: &str, macros: &mut MacroTable, ctx: &EvalContext<'_>) -> i64 {
     eval_inner(expr, macros, 0, Some(ctx))
+}
+
+/// Tri-state truth value of a conditional under incomplete macro knowledge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cond {
+    True,
+    False,
+    Unknown,
+}
+
+/// Evaluate a `#if`/`#elif` controlling expression.
+/// `conservative = false` reproduces today's semantics exactly
+/// (result != 0 → True, else False; never Unknown).
+pub fn evaluate_cond(
+    expr: &str,
+    macros: &mut MacroTable,
+    ctx: &EvalContext<'_>,
+    conservative: bool,
+) -> Cond {
+    if !conservative {
+        return if evaluate_with_context(expr, macros, ctx) != 0 {
+            Cond::True
+        } else {
+            Cond::False
+        };
+    }
+
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Cond::False;
+    }
+
+    // 1. `__has_include(...)` / `__has_include_next(...)`: found → 1. NOT
+    //    found → Unknown, since the header may exist in compiler-internal
+    //    search paths the scanner can't see (deliberate over-approximation).
+    let expr = match scan_has_include(expr, Some(ctx), Some(macros), true) {
+        HasIncludeScan::NotFound => return Cond::Unknown,
+        HasIncludeScan::Replaced(s) => s,
+        HasIncludeScan::Unchanged => expr.to_string(),
+    };
+
+    // 2. Replace `defined(X)` / `defined X` BEFORE macro expansion; an
+    //    Unknown operand poisons the whole condition.
+    let expr = match replace_defined(&expr, macros) {
+        Some(s) => s,
+        None => return Cond::Unknown,
+    };
+
+    // 3. Expand macros.
+    let expanded = macros.expand(&expr);
+
+    // Expansion can reveal further `__has_include` / `defined` operators.
+    let expanded = match scan_has_include(&expanded, Some(ctx), Some(macros), true) {
+        HasIncludeScan::NotFound => return Cond::Unknown,
+        HasIncludeScan::Replaced(s) => s,
+        HasIncludeScan::Unchanged => expanded,
+    };
+    let expanded = match replace_defined(&expanded, macros) {
+        Some(s) => s,
+        None => return Cond::Unknown,
+    };
+
+    // 4. Any identifier that survives expansion with Unknown state poisons
+    //    the result. (Defined identifiers can legitimately remain — e.g.
+    //    self-referential macros — and evaluate through the parser as today;
+    //    Undefined identifiers evaluate to 0 per C.)
+    if has_unknown_identifier(&expanded, macros) {
+        return Cond::Unknown;
+    }
+
+    // 5. Fully decidable — run the Pratt parser as usual.
+    let mut p = Parser::new(&expanded, macros);
+    if p.parse_expr(0) != 0 {
+        Cond::True
+    } else {
+        Cond::False
+    }
+}
+
+/// Replace `defined(X)` / `defined X` occurrences with `1`/`0` per
+/// [`MacroTable::state_of`] (conservative mode). Uses the same tokenization
+/// discipline as the expander: string/char literals and pp-numbers are
+/// passed through untouched.
+///
+/// Returns `None` if any tested name is Unknown.
+fn replace_defined(expr: &str, macros: &MacroTable) -> Option<String> {
+    if !expr.contains("defined") {
+        return Some(expr.to_string());
+    }
+
+    let bytes = expr.as_bytes();
+    let mut result = String::with_capacity(expr.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // String / character literals — pass through.
+        if b == b'"' || b == b'\'' {
+            let start = i;
+            i = skip_literal(bytes, i);
+            result.push_str(&expr[start..i]);
+            continue;
+        }
+
+        // pp-numbers (0x1fU, 1L, …) start with a digit — pass through whole.
+        if b.is_ascii_digit() {
+            let start = i;
+            i = skip_pp_number(bytes, i);
+            result.push_str(&expr[start..i]);
+            continue;
+        }
+
+        // Identifier
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &expr[start..i];
+            if ident != "defined" {
+                result.push_str(ident);
+                continue;
+            }
+
+            // Parse `defined(NAME)` or `defined NAME`.
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let has_paren = j < bytes.len() && bytes[j] == b'(';
+            if has_paren {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            if j >= bytes.len() || (!bytes[j].is_ascii_alphabetic() && bytes[j] != b'_') {
+                // Malformed `defined` — pass through; the parser yields 0 as today.
+                result.push_str(ident);
+                continue;
+            }
+            let name_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let name = &expr[name_start..j];
+            if has_paren {
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b')' {
+                    j += 1;
+                }
+            }
+            match macros.state_of(name, true) {
+                MacroState::Defined => result.push('1'),
+                MacroState::Undefined => result.push('0'),
+                MacroState::Unknown => return None,
+            }
+            i = j;
+            continue;
+        }
+
+        result.push(b as char);
+        i += 1;
+    }
+
+    Some(result)
+}
+
+/// Whether any identifier remaining after macro expansion has Unknown state.
+fn has_unknown_identifier(expr: &str, macros: &MacroTable) -> bool {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b == b'"' || b == b'\'' {
+            i = skip_literal(bytes, i);
+            continue;
+        }
+
+        if b.is_ascii_digit() {
+            i = skip_pp_number(bytes, i);
+            continue;
+        }
+
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if macros.state_of(&expr[start..i], true) == MacroState::Unknown {
+                return true;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    false
+}
+
+/// Skip a string or character literal starting at the opening quote.
+fn skip_literal(bytes: &[u8], mut i: usize) -> usize {
+    let quote = bytes[i];
+    i += 1;
+    while i < bytes.len() && bytes[i] != quote {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+        }
+        i += 1;
+    }
+    if i < bytes.len() {
+        i += 1; // closing quote
+    }
+    i
+}
+
+/// Skip a pp-number token starting at a digit (covers `0x1fU`, `1L`, `1.5f`).
+fn skip_pp_number(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+    {
+        i += 1;
+    }
+    i
 }
 
 fn eval_inner(
@@ -66,10 +296,36 @@ fn eval_inner(
 fn resolve_has_include(
     expr: &str,
     ctx: Option<&EvalContext<'_>>,
-    mut macros: Option<&mut MacroTable>,
+    macros: Option<&mut MacroTable>,
 ) -> Option<String> {
+    match scan_has_include(expr, ctx, macros, false) {
+        HasIncludeScan::Replaced(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Result of scanning an expression for `__has_include` operators.
+enum HasIncludeScan {
+    /// No `__has_include` present (or nothing replaceable).
+    Unchanged,
+    /// All occurrences resolved and replaced with `0`/`1`.
+    Replaced(String),
+    /// An occurrence did not resolve (`unknown_on_missing` mode only).
+    NotFound,
+}
+
+/// Scan for `__has_include` / `__has_include_next` operators, replacing each
+/// with `1` (found) or `0` (not found). With `unknown_on_missing`, an
+/// unresolved header aborts the scan with [`HasIncludeScan::NotFound`]
+/// instead of substituting `0`.
+fn scan_has_include(
+    expr: &str,
+    ctx: Option<&EvalContext<'_>>,
+    mut macros: Option<&mut MacroTable>,
+    unknown_on_missing: bool,
+) -> HasIncludeScan {
     if !expr.contains("__has_include") {
-        return None;
+        return HasIncludeScan::Unchanged;
     }
 
     let mut result = String::with_capacity(expr.len());
@@ -126,6 +382,9 @@ fn resolve_has_include(
                             } else {
                                 false
                             };
+                            if !found && unknown_on_missing {
+                                return HasIncludeScan::NotFound;
+                            }
                             result.push_str(if found { "1" } else { "0" });
                             i = j;
                             changed = true;
@@ -173,6 +432,9 @@ fn resolve_has_include(
                     } else {
                         false
                     };
+                    if !found && unknown_on_missing {
+                        return HasIncludeScan::NotFound;
+                    }
                     result.push_str(if found { "1" } else { "0" });
                     i = j;
                     changed = true;
@@ -185,9 +447,9 @@ fn resolve_has_include(
     }
 
     if changed {
-        Some(result)
+        HasIncludeScan::Replaced(result)
     } else {
-        None
+        HasIncludeScan::Unchanged
     }
 }
 

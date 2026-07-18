@@ -58,6 +58,10 @@ pub struct ScanOptions {
     pub missing_as_generated: bool,
     /// Whether to process trigraphs (`-trigraphs`).
     pub trigraphs: bool,
+    /// Conservative mode: conditionals on unknown macros (e.g. compiler
+    /// predefs when scanning without the predefined-macro table) follow
+    /// both branches, producing a sound superset of the include set.
+    pub conservative: bool,
 }
 
 /// Result of scanning a single translation unit.
@@ -108,6 +112,7 @@ impl Scanner {
         let dep_options = depgraph::DepCollectOptions {
             missing_as_generated: self.options.missing_as_generated,
             trigraphs: self.options.trigraphs,
+            conservative: self.options.conservative,
         };
         let deps = depgraph::collect_deps(
             source,
@@ -185,6 +190,7 @@ impl Scanner {
         let dep_options = depgraph::DepCollectOptions {
             missing_as_generated: options.missing_as_generated,
             trigraphs: options.trigraphs,
+            conservative: options.conservative,
         };
         let deps = depgraph::collect_deps(
             source,

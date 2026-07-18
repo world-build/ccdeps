@@ -258,6 +258,7 @@ fn main() -> Result<()> {
             output_options,
             missing_as_generated: args.mg,
             trigraphs: args.trigraphs,
+            conservative: false,
         };
 
         let scanner = Scanner::new(options);

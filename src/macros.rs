@@ -25,6 +25,27 @@ pub enum MacroDef {
     },
 }
 
+/// What the scanner knows about a macro name for conditional evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacroState {
+    Defined,
+    Undefined,
+    Unknown,
+}
+
+/// Non-reserved macro names that gcc/clang have historically predefined
+/// for system identification (`-std=gnu*` legacy system macros).
+const LEGACY_SYSTEM_MACROS: &[&str] = &[
+    "unix", "linux", "i386", "arm", "mips", "sparc", "powerpc", "sun", "vax", "hpux", "bsdi",
+];
+
+/// Whether a compiler might predefine `name`: reserved identifiers
+/// (leading underscore, covering `__GNUC__`, `_WIN32`, `_LP64`, …) and the
+/// legacy non-reserved system macros.
+fn could_be_predefined(name: &str) -> bool {
+    name.starts_with('_') || LEGACY_SYSTEM_MACROS.contains(&name)
+}
+
 /// Tracks defined macros for conditional evaluation and expansion.
 #[derive(Debug, Clone, Default)]
 pub struct MacroTable {
@@ -33,6 +54,12 @@ pub struct MacroTable {
     /// Stack for `#pragma push_macro` / `pop_macro`.
     /// Each entry is (macro_name, saved_definition).
     macro_stack: Vec<(String, Option<MacroDef>)>,
+    /// Names explicitly `#undef`'d (tombstones). `#undef` applies to compiler
+    /// predefs too, so a tombstoned name is *known undefined*.
+    undefed: HashSet<String>,
+    /// Names whose state was forcibly made unknown (defined/undefined inside
+    /// a branch the scanner is not sure is taken).
+    unknown: HashSet<String>,
 }
 
 impl MacroTable {
@@ -41,6 +68,8 @@ impl MacroTable {
             macros: HashMap::new(),
             counter: 0,
             macro_stack: Vec::new(),
+            undefed: HashSet::new(),
+            unknown: HashSet::new(),
         }
     }
 
@@ -49,6 +78,8 @@ impl MacroTable {
     /// `#define FOO` → `define("FOO", None)`
     /// `#define FOO 1` → `define("FOO", Some("1"))`
     pub fn define(&mut self, name: &str, value: Option<&str>) {
+        self.undefed.remove(name);
+        self.unknown.remove(name);
         self.macros.insert(
             name.to_string(),
             MacroDef::ObjectLike {
@@ -107,6 +138,8 @@ impl MacroTable {
             }
         }
 
+        self.undefed.remove(name);
+        self.unknown.remove(name);
         self.macros.insert(
             name.to_string(),
             MacroDef::FunctionLike {
@@ -118,9 +151,40 @@ impl MacroTable {
         );
     }
 
-    /// Remove a macro definition.
+    /// Remove a macro definition, leaving a tombstone: the name is now
+    /// *known undefined*, even if a compiler would otherwise predefine it.
     pub fn undef(&mut self, name: &str) {
         self.macros.remove(name);
+        self.unknown.remove(name);
+        self.undefed.insert(name.to_string());
+    }
+
+    /// Forget everything about a macro's state: it was defined or undefined
+    /// inside a branch the scanner is not sure is taken, so its real state
+    /// is unknown until a later *certain* define/undef restores knowledge.
+    pub fn mark_unknown(&mut self, name: &str) {
+        self.macros.remove(name);
+        self.undefed.remove(name);
+        self.unknown.insert(name.to_string());
+    }
+
+    /// What the scanner knows about `name` for conditional evaluation.
+    ///
+    /// `conservative`: whether unrecognized names that a compiler might
+    /// predefine (reserved identifiers and the legacy system macros)
+    /// count as Unknown rather than Undefined.
+    pub fn state_of(&self, name: &str, conservative: bool) -> MacroState {
+        if self.macros.contains_key(name) {
+            MacroState::Defined
+        } else if self.unknown.contains(name) {
+            MacroState::Unknown
+        } else if self.undefed.contains(name) {
+            MacroState::Undefined
+        } else if conservative && could_be_predefined(name) {
+            MacroState::Unknown
+        } else {
+            MacroState::Undefined
+        }
     }
 
     /// Check whether a macro is defined (for `defined(X)` operator).
@@ -149,6 +213,7 @@ impl MacroTable {
     }
 
     /// Restore a previously pushed macro definition (`#pragma pop_macro`).
+    /// Pop restores the pushed definition as *known* (not tri-state tracked).
     pub fn pop_macro(&mut self, name: &str) {
         // Search stack from top for matching name
         if let Some(idx) = self.macro_stack.iter().rposition(|(n, _)| n == name) {
@@ -793,5 +858,68 @@ mod tests {
         t.define_function_like("MAKE_HEADER", "(name) #name \".h\"");
         let result = t.expand("MAKE_HEADER(foo)");
         assert_eq!(result, "\"foo\" \".h\"");
+    }
+
+    // state_of rule 1: defined names are Defined regardless of mode.
+    #[test]
+    fn test_state_of_defined() {
+        let mut t = MacroTable::new();
+        t.define("FOO", Some("1"));
+        t.define("__GNUC__", Some("15"));
+        assert_eq!(t.state_of("FOO", false), MacroState::Defined);
+        assert_eq!(t.state_of("FOO", true), MacroState::Defined);
+        assert_eq!(t.state_of("__GNUC__", true), MacroState::Defined);
+    }
+
+    // state_of rule 2: marked-unknown names are Unknown, even non-predefinable ones.
+    #[test]
+    fn test_state_of_marked_unknown() {
+        let mut t = MacroTable::new();
+        t.mark_unknown("WITH_X");
+        assert_eq!(t.state_of("WITH_X", true), MacroState::Unknown);
+        assert_eq!(t.state_of("WITH_X", false), MacroState::Unknown);
+        // A later certain define/undef restores knowledge.
+        t.define("WITH_X", Some("1"));
+        assert_eq!(t.state_of("WITH_X", true), MacroState::Defined);
+        t.mark_unknown("WITH_X");
+        t.undef("WITH_X");
+        assert_eq!(t.state_of("WITH_X", true), MacroState::Undefined);
+    }
+
+    // state_of rule 3: #undef tombstones make even predefinable names known-undefined.
+    #[test]
+    fn test_state_of_undefed_tombstone() {
+        let mut t = MacroTable::new();
+        t.undef("_WIN32");
+        assert_eq!(t.state_of("_WIN32", true), MacroState::Undefined);
+        assert_eq!(t.state_of("_WIN32", false), MacroState::Undefined);
+        // mark_unknown beats an earlier tombstone…
+        t.mark_unknown("_WIN32");
+        assert_eq!(t.state_of("_WIN32", true), MacroState::Unknown);
+        // …and a define clears the tombstone.
+        t.undef("_LP64");
+        t.define("_LP64", None);
+        assert_eq!(t.state_of("_LP64", true), MacroState::Defined);
+    }
+
+    // state_of rule 4: predefinable names are Unknown only in conservative mode.
+    #[test]
+    fn test_state_of_conservative_predefinable() {
+        let t = MacroTable::new();
+        for name in ["__linux__", "_WIN32", "_LP64", "__GNUC__", "unix", "linux"] {
+            assert_eq!(t.state_of(name, true), MacroState::Unknown, "{name}");
+            assert_eq!(t.state_of(name, false), MacroState::Undefined, "{name}");
+        }
+        // `true`/`false` are plain identifiers to the evaluator, not predefs.
+        assert_eq!(t.state_of("true", true), MacroState::Undefined);
+        assert_eq!(t.state_of("false", true), MacroState::Undefined);
+    }
+
+    // state_of rule 5: everything else is Undefined in both modes.
+    #[test]
+    fn test_state_of_plain_undefined() {
+        let t = MacroTable::new();
+        assert_eq!(t.state_of("FOO", true), MacroState::Undefined);
+        assert_eq!(t.state_of("FOO", false), MacroState::Undefined);
     }
 }

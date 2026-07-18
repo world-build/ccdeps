@@ -49,6 +49,7 @@ pub mod scanner;
 pub mod vfs;
 
 pub use depgraph::{DepCollectOptions, DepEntry};
+pub use directive::IncludeStyle;
 pub use output::OutputOptions;
 pub use scanner::{DepMode, ScanOptions, ScanResult, Scanner};
 pub use vfs::{OsVfs, Vfs};
