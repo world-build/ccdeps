@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "pins": {
+    "community": {
+      "kind": "git",
+      "url": "ssh://git@github.com/world-build/community.world.git",
+      "branch": "main",
+      "rev": "8fd5b8856c9b1cd48cb12f5181bf9d15802ec49b",
+      "hash": "sha256-Vby4AFjiVvHomsJ9/t0UIigRtTKja1pi9Au/ErnhzB0="
+    },
+    "nixpkgs": {
+      "kind": "github",
+      "owner": "nixos",
+      "repo": "nixpkgs",
+      "branch": "nixos-unstable",
+      "rev": "567a49d1913ce81ac6e9582e3553dd90a955875f",
+      "hash": "sha256-lrp67w8AulE9Ks53n27I45ADSzbOCn4H+CNW1Ck8B+8="
+    }
+  }
+}

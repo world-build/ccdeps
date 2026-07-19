@@ -1,59 +1,29 @@
 [workspace]
 members = [
     ".",
-    "crates/cppscan-cli",
+    "crates/ccdeps-cli",
 ]
 
 [package]
-name = "cppscan"
+name = "ccdeps"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance C preprocessor dependency scanner"
 license = "MIT"
-repository = "https://github.com/hinshun/cppscan"
+repository = "https://github.com/world-build/ccdeps"
 
 [lib]
-name = "cppscan"
+name = "ccdeps"
 
 [dependencies]
-# Parallelism
-rayon = "1"
-
-# Fast concurrent collections
 dashmap = "6"
-
-# Memory-mapped I/O
 memmap2 = "0.9"
-
-# SIMD-accelerated byte scanning
 memchr = "2"
-
-# Arena allocation
-bumpalo = { version = "3", features = ["collections"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Shell word splitting (for compile_commands.json "command" field)
-shlex = "1"
-
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Path handling
-camino = "1"
 
 [dev-dependencies]
 criterion = "0.5"
-pretty_assertions = "1"
 tempfile = "3"
-insta = { version = "1", features = ["yaml"] }
+rayon = "1"
 
 [[bench]]
 name = "scan"

@@ -1,0 +1,23 @@
+[package]
+name = "ccdeps-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for ccdeps, a high-performance C preprocessor dependency scanner"
+
+[[bin]]
+name = "ccdeps"
+path = "src/main.rs"
+
+[dependencies]
+ccdeps = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shlex = "1"
+
+[dev-dependencies]
+tempfile = "3"

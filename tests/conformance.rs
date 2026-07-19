@@ -1,6 +1,6 @@
 //! Conformance test suite.
 //!
-//! Compares cppscan output against `gcc -M` and `clang -M` to ensure
+//! Compares ccdeps output against `gcc -M` and `clang -M` to ensure
 //! we produce identical dependency lists.
 
 use std::collections::BTreeSet;
@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cppscan::{ScanOptions, Scanner};
+use ccdeps::{ScanOptions, Scanner};
 
 /// Parse a Makefile-format dependency output into a set of dependency paths.
 fn parse_makefile_deps(output: &str) -> BTreeSet<String> {
@@ -62,10 +62,10 @@ fn get_compiler_deps(
     Some(parse_makefile_deps(&stdout))
 }
 
-/// Run cppscan and return parsed dependencies.
-fn get_cppscan_deps(source: &Path, include_paths: &[PathBuf]) -> BTreeSet<String> {
+/// Run ccdeps and return parsed dependencies.
+fn get_ccdeps_deps(source: &Path, include_paths: &[PathBuf]) -> BTreeSet<String> {
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: include_paths.to_vec(),
             ..Default::default()
         },
@@ -105,17 +105,17 @@ impl TestCase {
 
 // ---- Conformance tests ----
 
-/// Compare cppscan vs gcc/clang on a test case. Skips if compiler not available.
+/// Compare ccdeps vs gcc/clang on a test case. Skips if compiler not available.
 fn assert_matches_compiler(source: &Path, include_paths: &[PathBuf], compiler: &str) {
-    let cppscan_deps = get_cppscan_deps(source, include_paths);
+    let ccdeps_deps = get_ccdeps_deps(source, include_paths);
 
     if let Some(compiler_deps) = get_compiler_deps(compiler, source, include_paths) {
         // Remove the source file itself from both sets for comparison
         // (compilers include it, we include it)
         let source_str = source.to_string_lossy().to_string();
 
-        let cppscan_only: BTreeSet<_> = cppscan_deps.difference(&compiler_deps).collect();
-        let compiler_only: BTreeSet<_> = compiler_deps.difference(&cppscan_deps).collect();
+        let ccdeps_only: BTreeSet<_> = ccdeps_deps.difference(&compiler_deps).collect();
+        let compiler_only: BTreeSet<_> = compiler_deps.difference(&ccdeps_deps).collect();
 
         // Filter out the source file and system/implicit headers that we don't resolve.
         // gcc implicitly includes stdc-predef.h; system headers live under /usr/ or /nix/store/.
@@ -126,17 +126,17 @@ fn assert_matches_compiler(source: &Path, include_paths: &[PathBuf], compiler: &
             .into_iter()
             .filter(|p| !is_system(p))
             .collect();
-        let cppscan_only_filtered: BTreeSet<_> =
-            cppscan_only.into_iter().filter(|p| !is_system(p)).collect();
+        let ccdeps_only_filtered: BTreeSet<_> =
+            ccdeps_only.into_iter().filter(|p| !is_system(p)).collect();
 
         assert!(
-            cppscan_only_filtered.is_empty() && compiler_only_filtered.is_empty(),
-            "Mismatch with {}:\n  cppscan extra: {:?}\n  {} extra: {:?}\n  cppscan: {:?}\n  {}: {:?}",
+            ccdeps_only_filtered.is_empty() && compiler_only_filtered.is_empty(),
+            "Mismatch with {}:\n  ccdeps extra: {:?}\n  {} extra: {:?}\n  ccdeps: {:?}\n  {}: {:?}",
             compiler,
-            cppscan_only_filtered,
+            ccdeps_only_filtered,
             compiler,
             compiler_only_filtered,
-            cppscan_deps,
+            ccdeps_deps,
             compiler,
             compiler_deps,
         );
@@ -411,14 +411,14 @@ fn conformance_mm_omits_system_headers() {
         "#include \"user.h\"\n#include <sys.h>\nint main() {}\n",
     );
 
-    // cppscan with -MM mode should omit system header
+    // ccdeps with -MM mode should omit system header
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             system_paths: vec![sys_dir.path().to_path_buf()],
             ..Default::default()
         },
-        dep_mode: cppscan::DepMode::MM,
+        dep_mode: ccdeps::DepMode::MM,
         ..Default::default()
     };
 
@@ -447,11 +447,11 @@ fn conformance_mp_phony_targets() {
     );
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
-        output_options: cppscan::OutputOptions {
+        output_options: ccdeps::OutputOptions {
             phony: true,
             ..Default::default()
         },
@@ -488,11 +488,11 @@ fn conformance_mt_custom_target() {
     let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
-        output_options: cppscan::OutputOptions {
+        output_options: ccdeps::OutputOptions {
             targets: vec!["build/main.o".to_string()],
             ..Default::default()
         },
@@ -516,11 +516,11 @@ fn conformance_mq_quoted_target() {
     let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
-        output_options: cppscan::OutputOptions {
+        output_options: ccdeps::OutputOptions {
             quoted_targets: vec!["$build/main.o".to_string()],
             ..Default::default()
         },
@@ -545,11 +545,11 @@ fn conformance_multiple_mt_targets() {
     let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
-        output_options: cppscan::OutputOptions {
+        output_options: ccdeps::OutputOptions {
             targets: vec!["a.o".to_string(), "b.o".to_string()],
             ..Default::default()
         },
@@ -573,11 +573,11 @@ fn conformance_md_writes_dep_file() {
     let source = tc.write_file("main.c", "#include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
-        dep_mode: cppscan::DepMode::MD,
+        dep_mode: ccdeps::DepMode::MD,
         ..Default::default()
     };
 
@@ -603,7 +603,7 @@ fn conformance_mf_custom_dep_file() {
     let custom_dep = tc.path().join("custom.deps");
 
     let options = ScanOptions {
-        dep_mode: cppscan::DepMode::MD,
+        dep_mode: ccdeps::DepMode::MD,
         dep_file: Some(custom_dep.clone()),
         ..Default::default()
     };
@@ -627,13 +627,13 @@ fn conformance_mm_with_mp_phony_omits_system() {
     );
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             system_paths: vec![sys_dir.path().to_path_buf()],
             ..Default::default()
         },
-        dep_mode: cppscan::DepMode::MM,
-        output_options: cppscan::OutputOptions {
+        dep_mode: ccdeps::DepMode::MM,
+        output_options: ccdeps::OutputOptions {
             phony: true,
             ..Default::default()
         },
@@ -667,7 +667,7 @@ fn conformance_include_next() {
     let dir2 = tc.path().join("dir2");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![dir1, dir2],
             ..Default::default()
         },
@@ -699,7 +699,7 @@ fn conformance_import_once_only() {
     );
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
@@ -742,7 +742,7 @@ fn conformance_pragma_push_pop_macro() {
     );
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
@@ -792,7 +792,7 @@ fn conformance_trigraph_hash() {
     let source = tc.write_file("main.c", "??=include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
@@ -819,7 +819,7 @@ fn conformance_digraph_hash() {
     let source = tc.write_file("main.c", "%:include \"foo.h\"\nint main() {}\n");
 
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
@@ -852,11 +852,11 @@ fn conformance_pragma_system_header_mm() {
     // (it's found via a non-system path), but inner.h included from it is treated as system
     // because of #pragma GCC system_header
     let options = ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![tc.path().to_path_buf()],
             ..Default::default()
         },
-        dep_mode: cppscan::DepMode::MM,
+        dep_mode: ccdeps::DepMode::MM,
         ..Default::default()
     };
 

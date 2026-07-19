@@ -1,10 +1,11 @@
 //! Pratt parser/evaluator for C preprocessor `#if` expressions.
 //!
-//! Combined parse-and-evaluate in a single pass — no AST, returns `i64` directly.
+//! Combined parse-and-evaluate in a single pass, no AST, returns `i64` directly.
 //! Zero allocations on the evaluation path.
 //!
 //! Follows GCC's `expr.cc` (lines 1454-1810) operator-precedence structure.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::macros::{MacroState, MacroTable};
@@ -62,51 +63,159 @@ pub fn evaluate_cond(
         return Cond::False;
     }
 
-    // 1. `__has_include(...)` / `__has_include_next(...)`: found → 1. NOT
-    //    found → Unknown, since the header may exist in compiler-internal
-    //    search paths the scanner can't see (deliberate over-approximation).
-    let expr = match scan_has_include(expr, Some(ctx), Some(macros), true) {
+    // Each step borrows the previous form and allocates only when it actually
+    // rewrites something. A plain predef test (`#if defined(_WIN32)`,
+    // `#if __GNUC__ >= 4`) rewrites nothing before it resolves to Unknown, so
+    // the common conservative conditional makes zero heap allocations.
+
+    // 1. `__has_include(...)`: found → 1; not found → Unknown, since the header
+    //    may live in compiler-internal search paths we can't see.
+    let expr: Cow<str> = match scan_has_include(expr, Some(ctx), Some(macros), true) {
         HasIncludeScan::NotFound => return Cond::Unknown,
-        HasIncludeScan::Replaced(s) => s,
-        HasIncludeScan::Unchanged => expr.to_string(),
+        HasIncludeScan::Unchanged => Cow::Borrowed(expr),
+        HasIncludeScan::Replaced(s) => Cow::Owned(s),
     };
 
-    // 2. Replace `defined(X)` / `defined X` BEFORE macro expansion; an
-    //    Unknown operand poisons the whole condition.
-    let expr = match replace_defined(&expr, macros) {
-        Some(s) => s,
+    // 2. Replace `defined(X)` / `defined X` before expansion; an Unknown
+    //    operand poisons the condition. Check for that first (allocation-free)
+    //    so the poisoned path never builds a throwaway string.
+    let expr = match replace_defined_cow(expr, macros) {
+        Some(e) => e,
         None => return Cond::Unknown,
     };
 
-    // 3. Expand macros.
-    let expanded = macros.expand(&expr);
+    // 3. Expand macros, but only when the expression contains one that expands.
+    let expanded: Cow<str> = if has_expandable_macro(&expr, macros) {
+        Cow::Owned(macros.expand(&expr))
+    } else {
+        expr
+    };
 
     // Expansion can reveal further `__has_include` / `defined` operators.
-    let expanded = match scan_has_include(&expanded, Some(ctx), Some(macros), true) {
+    let expanded: Cow<str> = match scan_has_include(&expanded, Some(ctx), Some(macros), true) {
         HasIncludeScan::NotFound => return Cond::Unknown,
-        HasIncludeScan::Replaced(s) => s,
         HasIncludeScan::Unchanged => expanded,
+        HasIncludeScan::Replaced(s) => Cow::Owned(s),
     };
-    let expanded = match replace_defined(&expanded, macros) {
-        Some(s) => s,
+    let expanded = match replace_defined_cow(expanded, macros) {
+        Some(e) => e,
         None => return Cond::Unknown,
     };
 
     // 4. Any identifier that survives expansion with Unknown state poisons
-    //    the result. (Defined identifiers can legitimately remain — e.g.
-    //    self-referential macros — and evaluate through the parser as today;
+    //    the result. (Defined identifiers can legitimately remain, e.g.
+    //    self-referential macros, and evaluate through the parser as today;
     //    Undefined identifiers evaluate to 0 per C.)
     if has_unknown_identifier(&expanded, macros) {
         return Cond::Unknown;
     }
 
-    // 5. Fully decidable — run the Pratt parser as usual.
+    // 5. Fully decidable, run the Pratt parser as usual.
     let mut p = Parser::new(&expanded, macros);
     if p.parse_expr(0) != 0 {
         Cond::True
     } else {
         Cond::False
     }
+}
+
+/// `replace_defined`, but borrowing: returns the input unchanged (no allocation)
+/// when it has no `defined` operator, `None` when an operand is Unknown, and an
+/// owned rewrite only when there is decidable `defined(...)` to substitute.
+fn replace_defined_cow<'a>(expr: Cow<'a, str>, macros: &MacroTable) -> Option<Cow<'a, str>> {
+    if !expr.contains("defined") {
+        return Some(expr);
+    }
+    if defined_has_unknown(&expr, macros) {
+        return None;
+    }
+    Some(Cow::Owned(replace_defined(&expr, macros)?))
+}
+
+/// Whether any `defined(X)` / `defined X` operand is Unknown. Scans without
+/// building a result, so the poisoned conditional stays allocation-free.
+fn defined_has_unknown(expr: &str, macros: &MacroTable) -> bool {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\'' {
+            i = skip_literal(bytes, i);
+            continue;
+        }
+        if b.is_ascii_digit() {
+            i = skip_pp_number(bytes, i);
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if &expr[start..i] != "defined" {
+                continue;
+            }
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            if j >= bytes.len() || (!bytes[j].is_ascii_alphabetic() && bytes[j] != b'_') {
+                continue;
+            }
+            let name_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if macros.state_of(&expr[name_start..j], true) == MacroState::Unknown {
+                return true;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the expression contains an identifier that macro expansion would
+/// rewrite. Lets the evaluator skip `MacroTable::expand` (and its allocation)
+/// for the common conditional whose identifiers are all predefs / undefined.
+fn has_expandable_macro(expr: &str, macros: &MacroTable) -> bool {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\'' {
+            i = skip_literal(bytes, i);
+            continue;
+        }
+        if b.is_ascii_digit() {
+            i = skip_pp_number(bytes, i);
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &expr[start..i];
+            if ident == "defined" || ident == "__has_include" || ident == "__has_include_next" {
+                continue; // operators, not expandable operands
+            }
+            if ident == "__COUNTER__" || macros.get_def(ident).is_some() {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Replace `defined(X)` / `defined X` occurrences with `1`/`0` per
@@ -127,7 +236,7 @@ fn replace_defined(expr: &str, macros: &MacroTable) -> Option<String> {
     while i < bytes.len() {
         let b = bytes[i];
 
-        // String / character literals — pass through.
+        // String / character literals, pass through.
         if b == b'"' || b == b'\'' {
             let start = i;
             i = skip_literal(bytes, i);
@@ -135,7 +244,7 @@ fn replace_defined(expr: &str, macros: &MacroTable) -> Option<String> {
             continue;
         }
 
-        // pp-numbers (0x1fU, 1L, …) start with a digit — pass through whole.
+        // pp-numbers (0x1fU, 1L, ...) start with a digit, pass through whole.
         if b.is_ascii_digit() {
             let start = i;
             i = skip_pp_number(bytes, i);
@@ -168,7 +277,7 @@ fn replace_defined(expr: &str, macros: &MacroTable) -> Option<String> {
                 }
             }
             if j >= bytes.len() || (!bytes[j].is_ascii_alphabetic() && bytes[j] != b'_') {
-                // Malformed `defined` — pass through; the parser yields 0 as today.
+                // Malformed `defined`, pass through; the parser yields 0 as today.
                 result.push_str(ident);
                 continue;
             }
@@ -392,7 +501,7 @@ fn scan_has_include(
                         }
                     }
                 } else if let Some(ref mut macros) = macros {
-                    // Argument is not a string/angle literal — try macro expansion.
+                    // Argument is not a string/angle literal, try macro expansion.
                     // Extract the full argument up to matching ')'.
                     let arg_start = j;
                     let mut depth = 1;
@@ -832,7 +941,7 @@ impl<'a> Parser<'a> {
 
         // ---- led (left denotation) ----
         loop {
-            // (left_bp, right_bp) — left < right for left-associative
+            // (left_bp, right_bp), left < right for left-associative
             let (lbp, rbp) = match self.token {
                 Token::PipePipe => (4, 5),
                 Token::AmpAmp => (6, 7),
@@ -1212,6 +1321,48 @@ mod tests {
             evaluate_with_context("__has_include(<missing.h>)", &mut m, &ctx),
             0
         );
+    }
+
+    // Conservative tri-state evaluation (Cow fast paths).
+    fn cond(expr: &str, macros: &mut MacroTable) -> Cond {
+        let sp = crate::resolve::SearchPaths::default();
+        let ctx = EvalContext {
+            search_paths: &sp,
+            current_file_dir: Path::new("."),
+            vfs: &crate::vfs::OsVfs,
+        };
+        evaluate_cond(expr, macros, &ctx, true)
+    }
+
+    #[test]
+    fn conservative_predef_is_unknown() {
+        let mut m = MacroTable::new();
+        assert_eq!(cond("defined(__linux__)", &mut m), Cond::Unknown);
+        assert_eq!(cond("__GNUC__ >= 4", &mut m), Cond::Unknown);
+        assert_eq!(
+            cond("defined(_WIN32) || defined(_WIN64)", &mut m),
+            Cond::Unknown
+        );
+    }
+
+    #[test]
+    fn conservative_decidable() {
+        let mut m = MacroTable::new();
+        m.define("FOO", Some("3"));
+        assert_eq!(cond("FOO > 2", &mut m), Cond::True);
+        assert_eq!(cond("FOO < 2", &mut m), Cond::False);
+        assert_eq!(cond("defined(FOO)", &mut m), Cond::True);
+        // BAR is not underscore-prefixed, so it is known-undefined, not Unknown.
+        assert_eq!(cond("defined(BAR)", &mut m), Cond::False);
+        assert_eq!(cond("BAR", &mut m), Cond::False);
+    }
+
+    #[test]
+    fn conservative_marked_unknown_poisons() {
+        let mut m = MacroTable::new();
+        m.mark_unknown("WITH_X");
+        assert_eq!(cond("WITH_X", &mut m), Cond::Unknown);
+        assert_eq!(cond("defined(WITH_X)", &mut m), Cond::Unknown);
     }
 
     #[test]

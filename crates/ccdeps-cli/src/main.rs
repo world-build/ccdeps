@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
+use ccdeps::{DepMode, OutputOptions, ScanOptions, Scanner};
 use clap::Parser;
-use cppscan::{DepMode, OutputOptions, ScanOptions, Scanner};
+use rayon::prelude::*;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::Command;
+
+mod compdb;
 
 /// High-performance C preprocessor dependency scanner.
 ///
 /// Produces output compatible with `gcc -M` / `clang -M`.
 #[derive(Parser, Debug)]
-#[command(name = "cppscan", version, about)]
+#[command(name = "ccdeps", version, about)]
 struct Args {
     /// Source files to scan.
     files: Vec<PathBuf>,
@@ -219,15 +222,17 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // Parallelism lives here, in the consumer: the library scans one TU at a
+    // time and stays thread-safe, so the CLI batches files over rayon while
+    // sharing one Scanner (and its content cache).
     let results = if let Some(ref db_path) = args.compilation_database {
-        // Compilation database mode: each entry has its own flags
-        let entries = cppscan::compdb::parse(db_path)
+        let entries = compdb::parse(db_path)
             .with_context(|| format!("failed to read {}", db_path.display()))?;
 
         let scan_entries: Vec<(PathBuf, ScanOptions)> = entries
             .iter()
             .map(|entry| {
-                let (source, mut opts) = cppscan::compdb::entry_to_scan_options(entry, &defines);
+                let (source, mut opts) = compdb::entry_to_scan_options(entry, &defines);
                 opts.dep_mode = dep_mode;
                 opts.missing_as_generated = args.mg;
                 opts.trigraphs = args.trigraphs;
@@ -237,7 +242,10 @@ fn main() -> Result<()> {
             .collect();
 
         let scanner = Scanner::new(ScanOptions::default());
-        scanner.scan_entries(&scan_entries)
+        scan_entries
+            .par_iter()
+            .map(|(source, opts)| scanner.scan_file_with_options(source, opts))
+            .collect::<Vec<_>>()
     } else {
         if args.files.is_empty() {
             anyhow::bail!(
@@ -246,7 +254,7 @@ fn main() -> Result<()> {
         }
 
         let options = ScanOptions {
-            search_paths: cppscan::resolve::SearchPaths {
+            search_paths: ccdeps::resolve::SearchPaths {
                 quote_paths: args.iquote_paths,
                 include_paths: args.include_paths,
                 system_paths: args.system_paths,
@@ -262,7 +270,10 @@ fn main() -> Result<()> {
         };
 
         let scanner = Scanner::new(options);
-        scanner.scan_files(&args.files)
+        args.files
+            .par_iter()
+            .map(|source| scanner.scan_file(source))
+            .collect::<Vec<_>>()
     };
 
     for result in results {
@@ -274,7 +285,7 @@ fn main() -> Result<()> {
                     print!("{}", scan.makefile_output);
                 }
             }
-            Err(e) => eprintln!("cppscan: error: {}", e),
+            Err(e) => eprintln!("ccdeps: error: {}", e),
         }
     }
 

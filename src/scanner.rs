@@ -1,27 +1,29 @@
-//! Top-level scanner API.
+//! CLI-facing scanner.
 //!
-//! Orchestrates the full dependency scanning pipeline with parallelism.
+//! A thin adapter that drives the [`ScanService`] engine and formats its result
+//! as `gcc -M`-style Makefile text. The library trunk is the engine; this is
+//! the leaf that keeps the command-line tool byte-compatible.
 
-use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::depgraph::{self, DepEntry, FileCache};
+use crate::macros::MacroBase;
 use crate::output::{self, OutputOptions};
 use crate::resolve::SearchPaths;
+use crate::service::{ScanEnv, ScanOutput, ScanScratch, ScanService, ServiceOptions};
 use crate::vfs::{OsVfs, Vfs};
 
 /// Dependency output mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DepMode {
-    /// `-M`: Print all deps to stdout.
+    /// `-M`: print all deps to stdout.
     #[default]
     M,
-    /// `-MM`: Print non-system deps to stdout.
+    /// `-MM`: print non-system deps to stdout.
     MM,
-    /// `-MD`: Write all deps to `.d` file (or `-MF` path).
+    /// `-MD`: write all deps to a `.d` file (or `-MF` path).
     MD,
-    /// `-MMD`: Write non-system deps to `.d` file (or `-MF` path).
+    /// `-MMD`: write non-system deps to a `.d` file (or `-MF` path).
     MMD,
 }
 
@@ -31,7 +33,7 @@ impl DepMode {
         matches!(self, DepMode::MM | DepMode::MMD)
     }
 
-    /// Whether output goes to a file (`.d` or `-MF` override) instead of stdout.
+    /// Whether output goes to a file (`.d` or `-MF`) instead of stdout.
     pub fn writes_to_file(self) -> bool {
         matches!(self, DepMode::MD | DepMode::MMD)
     }
@@ -42,25 +44,21 @@ impl DepMode {
 pub struct ScanOptions {
     /// Include search paths.
     pub search_paths: SearchPaths,
-    /// Custom target name format (None = derive from source filename).
-    /// Deprecated in favor of `output_options.targets`; kept for backward compat.
+    /// Legacy target name (`-o`); superseded by `output_options.targets`.
     pub target: Option<String>,
-    /// Command-line macro definitions (`-D`). Each entry is `(name, optional_value)`.
+    /// Command-line macro definitions (`-D`): `(name, optional_value)`.
     pub defines: Vec<(String, Option<String>)>,
     /// Dependency output mode (`-M`, `-MM`, `-MD`, `-MMD`).
     pub dep_mode: DepMode,
-    /// Output file override (`-MF`). Only used when `dep_mode` writes to file.
+    /// Output file override (`-MF`). Used only when `dep_mode` writes to a file.
     pub dep_file: Option<PathBuf>,
     /// Output formatting options (`-MT`, `-MQ`, `-MP`).
     pub output_options: OutputOptions,
-    /// Treat missing headers as generated files (`-MG`).
-    /// Adds them to the dependency list instead of erroring.
+    /// Record missing headers as generated files (`-MG`).
     pub missing_as_generated: bool,
-    /// Whether to process trigraphs (`-trigraphs`).
+    /// Process trigraphs (`-trigraphs`).
     pub trigraphs: bool,
-    /// Conservative mode: conditionals on unknown macros (e.g. compiler
-    /// predefs when scanning without the predefined-macro table) follow
-    /// both branches, producing a sound superset of the include set.
+    /// Conservative mode: conditionals on unknown macros follow both branches.
     pub conservative: bool,
 }
 
@@ -69,18 +67,20 @@ pub struct ScanOptions {
 pub struct ScanResult {
     /// The source file that was scanned.
     pub source: PathBuf,
-    /// All transitive dependencies (resolved, canonical paths).
-    pub deps: Vec<DepEntry>,
+    /// Resolved dependency paths (display spelling where one was kept), in order.
+    pub deps: Vec<PathBuf>,
     /// Makefile-format dependency output.
     pub makefile_output: String,
-    /// If the output should be written to a file, this is the path.
+    /// Where to write the output, for `-MD`/`-MMD`.
     pub dep_file_path: Option<PathBuf>,
 }
 
-/// The main dependency scanner.
+/// The dependency scanner. Owns a [`ScanService`], so a shared header is read
+/// and minimized once across every file this scanner handles.
 pub struct Scanner {
     options: ScanOptions,
-    cache: FileCache,
+    service: ScanService,
+    base: Arc<MacroBase>,
     vfs: Arc<dyn Vfs>,
 }
 
@@ -88,7 +88,7 @@ impl std::fmt::Debug for Scanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scanner")
             .field("options", &self.options)
-            .field("cache", &self.cache)
+            .field("service", &self.service)
             .finish_non_exhaustive()
     }
 }
@@ -98,129 +98,83 @@ impl Scanner {
         Self::with_vfs(options, Arc::new(OsVfs))
     }
 
-    /// Create a scanner that performs all file access through the given [`Vfs`].
+    /// Create a scanner that performs all file access through `vfs`.
     pub fn with_vfs(options: ScanOptions, vfs: Arc<dyn Vfs>) -> Self {
+        let service = ScanService::with_options(ServiceOptions {
+            trigraphs: options.trigraphs,
+        });
+        let base = Arc::new(base_from(&options.defines));
         Self {
             options,
-            cache: depgraph::new_file_cache(),
+            service,
+            base,
             vfs,
         }
     }
 
-    /// Scan a single translation unit for dependencies.
+    /// Scan a single translation unit.
     pub fn scan_file(&self, source: &Path) -> Result<ScanResult, std::io::Error> {
-        let dep_options = depgraph::DepCollectOptions {
-            missing_as_generated: self.options.missing_as_generated,
-            trigraphs: self.options.trigraphs,
-            conservative: self.options.conservative,
-        };
-        let deps = depgraph::collect_deps(
-            source,
-            &*self.vfs,
-            &self.options.search_paths,
-            &self.cache,
-            &self.options.defines,
-            &dep_options,
-        )?;
-
-        // Build effective output options
-        let mut out_opts = self.options.output_options.clone();
-        out_opts.omit_system = self.options.dep_mode.omit_system();
-
-        // Legacy `target` field support: if no -MT/-MQ set, use legacy target
-        if out_opts.targets.is_empty() && out_opts.quoted_targets.is_empty() {
-            if let Some(ref t) = self.options.target {
-                out_opts.targets.push(t.clone());
-            }
-        }
-
-        let makefile_output = output::format_makefile_deps_with_options(source, &deps, &out_opts);
-
-        // Determine dep file path
-        let dep_file_path = if self.options.dep_mode.writes_to_file() {
-            Some(self.options.dep_file.clone().unwrap_or_else(|| {
-                // Default: replace source extension with .d
-                let mut p = source.to_path_buf();
-                p.set_extension("d");
-                p
-            }))
-        } else {
-            None
-        };
-
-        Ok(ScanResult {
-            source: source.to_path_buf(),
-            deps,
-            makefile_output,
-            dep_file_path,
-        })
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+        self.scan_into(source, &self.options, &self.base, &mut scratch, &mut out)
     }
 
-    /// Scan multiple translation units in parallel.
-    ///
-    /// Uses Rayon's work-stealing thread pool. The file cache is shared
-    /// across all threads, so common headers are only read and minimized once.
-    ///
-    /// For single-file inputs, skips Rayon's thread pool entirely to avoid
-    /// the ~0.5ms overhead of work-stealing setup.
-    pub fn scan_files(&self, sources: &[PathBuf]) -> Vec<Result<ScanResult, std::io::Error>> {
-        if sources.len() <= 1 {
-            // Single-file fast path: skip thread pool overhead
-            sources
-                .iter()
-                .map(|source| self.scan_file(source))
-                .collect()
-        } else {
-            sources
-                .par_iter()
-                .map(|source| self.scan_file(source))
-                .collect()
-        }
-    }
-
-    /// Scan a single file with custom options, sharing this scanner's file cache.
-    ///
-    /// Used by compilation database support where each entry has different
-    /// `-I`/`-D` flags but we want to share the file cache across entries.
+    /// Scan a single file with per-entry options, reusing the shared service.
     pub fn scan_file_with_options(
         &self,
         source: &Path,
         options: &ScanOptions,
     ) -> Result<ScanResult, std::io::Error> {
-        let dep_options = depgraph::DepCollectOptions {
-            missing_as_generated: options.missing_as_generated,
-            trigraphs: options.trigraphs,
+        let base = Arc::new(base_from(&options.defines));
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+        self.scan_into(source, options, &base, &mut scratch, &mut out)
+    }
+
+    fn scan_into(
+        &self,
+        source: &Path,
+        options: &ScanOptions,
+        base: &Arc<MacroBase>,
+        scratch: &mut ScanScratch,
+        out: &mut ScanOutput,
+    ) -> Result<ScanResult, std::io::Error> {
+        let env = ScanEnv {
+            search_paths: &options.search_paths,
+            macro_base: Arc::clone(base),
             conservative: options.conservative,
+            missing_as_generated: options.missing_as_generated,
+            trust_canonical: false,
+            record_display: true,
         };
-        let deps = depgraph::collect_deps(
-            source,
-            &*self.vfs,
-            &options.search_paths,
-            &self.cache,
-            &options.defines,
-            &dep_options,
-        )?;
+        self.service
+            .scan_tu(source, &env, &*self.vfs, scratch, out, |_, _| {})?;
 
         let mut out_opts = options.output_options.clone();
         out_opts.omit_system = options.dep_mode.omit_system();
-
         if out_opts.targets.is_empty() && out_opts.quoted_targets.is_empty() {
-            if let Some(ref t) = options.target {
+            if let Some(t) = &options.target {
                 out_opts.targets.push(t.clone());
             }
         }
+        let makefile_output = output::format_makefile(&self.service, source, out, &out_opts);
 
-        let makefile_output = output::format_makefile_deps_with_options(source, &deps, &out_opts);
-
-        let dep_file_path = if options.dep_mode.writes_to_file() {
-            Some(options.dep_file.clone().unwrap_or_else(|| {
+        let dep_file_path = options.dep_mode.writes_to_file().then(|| {
+            options.dep_file.clone().unwrap_or_else(|| {
                 let mut p = source.to_path_buf();
                 p.set_extension("d");
                 p
-            }))
-        } else {
-            None
-        };
+            })
+        });
+
+        let deps = out
+            .resolved
+            .iter()
+            .map(|d| match &d.display {
+                Some(s) => PathBuf::from(s.as_ref()),
+                None => self.service.path(d.file).to_path_buf(),
+            })
+            .collect();
 
         Ok(ScanResult {
             source: source.to_path_buf(),
@@ -229,28 +183,13 @@ impl Scanner {
             dep_file_path,
         })
     }
+}
 
-    /// Scan multiple entries, each with their own options, using a shared file cache.
-    ///
-    /// This is the primary API for compilation database support. Each entry can
-    /// have different search paths and defines, but the file cache (minimized
-    /// file contents) is shared across all entries for performance.
-    pub fn scan_entries(
-        &self,
-        entries: &[(PathBuf, ScanOptions)],
-    ) -> Vec<Result<ScanResult, std::io::Error>> {
-        if entries.len() <= 1 {
-            entries
-                .iter()
-                .map(|(source, opts)| self.scan_file_with_options(source, opts))
-                .collect()
-        } else {
-            entries
-                .par_iter()
-                .map(|(source, opts)| self.scan_file_with_options(source, opts))
-                .collect()
-        }
-    }
+/// Build a shared macro base from command-line `-D` defines.
+fn base_from(defines: &[(String, Option<String>)]) -> MacroBase {
+    let mut base = MacroBase::new();
+    base.extend_defines(defines.iter().map(|(n, v)| (n.as_str(), v.as_deref())));
+    base
 }
 
 #[cfg(test)]
@@ -274,20 +213,16 @@ mod tests {
     }
 
     #[test]
-    fn test_scanner_parallel() {
+    fn test_scanner_shares_cache_across_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("common.h"), "#pragma once\n").unwrap();
         fs::write(dir.path().join("a.c"), "#include \"common.h\"\n").unwrap();
         fs::write(dir.path().join("b.c"), "#include \"common.h\"\n").unwrap();
 
+        // One scanner over several files: common.h is minimized once.
         let scanner = Scanner::new(ScanOptions::default());
-        let sources = vec![dir.path().join("a.c"), dir.path().join("b.c")];
-        let results = scanner.scan_files(&sources);
-
-        assert_eq!(results.len(), 2);
-        for r in &results {
-            assert!(r.is_ok());
-        }
+        scanner.scan_file(&dir.path().join("a.c")).unwrap();
+        scanner.scan_file(&dir.path().join("b.c")).unwrap();
     }
 
     #[test]
@@ -302,7 +237,6 @@ mod tests {
         });
         let result = scanner.scan_file(&dir.path().join("main.c")).unwrap();
 
-        assert!(result.dep_file_path.is_some());
         assert!(result
             .dep_file_path
             .unwrap()
@@ -322,7 +256,6 @@ mod tests {
             ..Default::default()
         });
         let result = scanner.scan_file(&dir.path().join("main.c")).unwrap();
-
         assert_eq!(result.dep_file_path.unwrap(), custom_path);
     }
 

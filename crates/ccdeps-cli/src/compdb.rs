@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::resolve::SearchPaths;
-use crate::scanner::ScanOptions;
+use ccdeps::resolve::SearchPaths;
+use ccdeps::ScanOptions;
 
 /// A single entry in a `compile_commands.json` file.
 #[derive(Debug, Deserialize)]

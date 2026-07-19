@@ -8,8 +8,9 @@
 //! - Predefined macros: `__FILE__`, `__LINE__`, `__COUNTER__`
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-/// A macro definition — either object-like or function-like.
+/// A macro definition, either object-like or function-like.
 #[derive(Debug, Clone)]
 pub enum MacroDef {
     /// `#define FOO` or `#define FOO value`
@@ -40,22 +41,131 @@ const LEGACY_SYSTEM_MACROS: &[&str] = &[
 ];
 
 /// Whether a compiler might predefine `name`: reserved identifiers
-/// (leading underscore, covering `__GNUC__`, `_WIN32`, `_LP64`, …) and the
+/// (leading underscore, covering `__GNUC__`, `_WIN32`, `_LP64`, ...) and the
 /// legacy non-reserved system macros.
 fn could_be_predefined(name: &str) -> bool {
     name.starts_with('_') || LEGACY_SYSTEM_MACROS.contains(&name)
 }
 
-/// Tracks defined macros for conditional evaluation and expansion.
+/// Parse a raw function-like body (starting at `(`) into a [`MacroDef`].
+/// Falls back to object-like if the parentheses do not form a parameter list.
+fn parse_function_like(params_and_body: &str) -> MacroDef {
+    let params_and_body = params_and_body.trim();
+    let Some(after_paren) = params_and_body.strip_prefix('(') else {
+        return MacroDef::ObjectLike {
+            value: Some(params_and_body.to_string()),
+        };
+    };
+    let Some(close) = after_paren.find(')') else {
+        return MacroDef::ObjectLike {
+            value: Some(params_and_body.to_string()),
+        };
+    };
+
+    let param_str = &after_paren[..close];
+    let body = after_paren[close + 1..].trim().to_string();
+
+    let mut params = Vec::new();
+    let mut is_variadic = false;
+    let mut variadic_name = None;
+    for p in param_str.split(',') {
+        let p = p.trim();
+        if p.is_empty() && param_str.trim().is_empty() {
+            break; // `#define FOO()`, zero params
+        }
+        if p == "..." {
+            is_variadic = true;
+        } else if p.ends_with("...") {
+            variadic_name = Some(p.trim_end_matches("...").trim().to_string());
+            is_variadic = true;
+        } else {
+            params.push(p.to_string());
+        }
+    }
+
+    MacroDef::FunctionLike {
+        params,
+        is_variadic,
+        variadic_name,
+        body,
+    }
+}
+
+/// An immutable, shareable macro layer holding a toolchain/target's fixed seed:
+/// compiler predefs and command-line `-D` defines, parsed once and shared
+/// (`Arc`) across every TU that uses them.
+///
+/// A per-TU [`MacroTable`] layers its own `#define`/`#undef`s on top and, between
+/// TUs, resets only that delta. Re-seeding a large predef table therefore costs
+/// nothing on the warm path, and function-like predefs (`__has_builtin(x) ...`)
+/// carry through where a flat `(name, value)` list could not.
+#[derive(Debug, Default)]
+pub struct MacroBase {
+    macros: HashMap<String, MacroDef>,
+}
+
+impl MacroBase {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Define an object-like macro. `#define FOO` → `define("FOO", None)`.
+    pub fn define(&mut self, name: &str, value: Option<&str>) {
+        self.macros.insert(
+            name.to_string(),
+            MacroDef::ObjectLike {
+                value: value.map(str::to_string),
+            },
+        );
+    }
+
+    /// Define a function-like macro from a raw body starting at `(`.
+    pub fn define_function_like(&mut self, name: &str, params_and_body: &str) {
+        self.macros
+            .insert(name.to_string(), parse_function_like(params_and_body));
+    }
+
+    /// Seed from a `(name, value)` list (command-line `-D`). A value beginning
+    /// with `(` is parsed as function-like.
+    pub fn extend_defines<'a>(
+        &mut self,
+        defines: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ) {
+        for (name, value) in defines {
+            match value {
+                Some(v) if v.starts_with('(') => {
+                    self.macros.insert(name.to_string(), parse_function_like(v));
+                }
+                other => self.define(name, other),
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.macros.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.macros.is_empty()
+    }
+}
+
+/// A per-TU macro table: the `#define`/`#undef` delta layered over an immutable
+/// [`MacroBase`]. Reused across TUs via [`clear`](MacroTable::clear) /
+/// [`reset`](MacroTable::reset), which drop only the delta and keep the shared
+/// base, so the warm path re-seeds nothing.
 #[derive(Debug, Clone, Default)]
 pub struct MacroTable {
+    /// Shared, immutable seed (predefs + `-D`). `None` is an empty base.
+    base: Option<Arc<MacroBase>>,
+    /// This TU's own definitions, shadowing the base.
     macros: HashMap<String, MacroDef>,
     counter: u32,
     /// Stack for `#pragma push_macro` / `pop_macro`.
     /// Each entry is (macro_name, saved_definition).
     macro_stack: Vec<(String, Option<MacroDef>)>,
     /// Names explicitly `#undef`'d (tombstones). `#undef` applies to compiler
-    /// predefs too, so a tombstoned name is *known undefined*.
+    /// predefs and the base too, so a tombstoned name is *known undefined*.
     undefed: HashSet<String>,
     /// Names whose state was forcibly made unknown (defined/undefined inside
     /// a branch the scanner is not sure is taken).
@@ -64,13 +174,50 @@ pub struct MacroTable {
 
 impl MacroTable {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A table layered over a shared base (predefs + `-D`).
+    pub fn with_base(base: Arc<MacroBase>) -> Self {
         Self {
-            macros: HashMap::new(),
-            counter: 0,
-            macro_stack: Vec::new(),
-            undefed: HashSet::new(),
-            unknown: HashSet::new(),
+            base: Some(base),
+            ..Self::default()
         }
+    }
+
+    /// Drop this TU's delta, keeping the base and retaining capacity. The warm
+    /// path calls this between TUs so no allocation is repeated.
+    pub fn clear(&mut self) {
+        self.macros.clear();
+        self.undefed.clear();
+        self.unknown.clear();
+        self.macro_stack.clear();
+        self.counter = 0;
+    }
+
+    /// Reset for a new TU, swapping in `base` (a cheap refcount bump) and
+    /// clearing the delta.
+    pub fn reset(&mut self, base: Arc<MacroBase>) {
+        self.clear();
+        self.base = Some(base);
+    }
+
+    /// The effective definition of `name`: the delta shadows the base, and a
+    /// tombstone or unknown-mark hides the base entirely.
+    fn lookup(&self, name: &str) -> Option<&MacroDef> {
+        if let Some(def) = self.macros.get(name) {
+            return Some(def);
+        }
+        if self.undefed.contains(name) || self.unknown.contains(name) {
+            return None;
+        }
+        self.base.as_ref()?.macros.get(name)
+    }
+
+    fn base_defines(&self, name: &str) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|b| b.macros.contains_key(name))
     }
 
     /// Define an object-like macro, optionally with a value.
@@ -93,62 +240,10 @@ impl MacroTable {
     /// `name` is the macro name, `params_and_body` is everything after the name
     /// starting with `(`.
     pub fn define_function_like(&mut self, name: &str, params_and_body: &str) {
-        let params_and_body = params_and_body.trim();
-        // Must start with '('
-        let after_paren = match params_and_body.strip_prefix('(') {
-            Some(s) => s,
-            None => {
-                // Not actually function-like, treat as object-like
-                self.define(name, Some(params_and_body));
-                return;
-            }
-        };
-
-        // Find matching close paren
-        let close = match after_paren.find(')') {
-            Some(i) => i,
-            None => {
-                self.define(name, Some(params_and_body));
-                return;
-            }
-        };
-
-        let param_str = &after_paren[..close];
-        let body = after_paren[close + 1..].trim().to_string();
-
-        let mut params = Vec::new();
-        let mut is_variadic = false;
-        let mut variadic_name = None;
-
-        for p in param_str.split(',') {
-            let p = p.trim();
-            if p.is_empty() && param_str.trim().is_empty() {
-                // #define FOO() — zero params
-                break;
-            }
-            if p == "..." {
-                is_variadic = true;
-            } else if p.ends_with("...") {
-                // Named variadic: #define FOO(args...)
-                let name_part = p.trim_end_matches("...").trim();
-                variadic_name = Some(name_part.to_string());
-                is_variadic = true;
-            } else {
-                params.push(p.to_string());
-            }
-        }
-
         self.undefed.remove(name);
         self.unknown.remove(name);
-        self.macros.insert(
-            name.to_string(),
-            MacroDef::FunctionLike {
-                params,
-                is_variadic,
-                variadic_name,
-                body,
-            },
-        );
+        self.macros
+            .insert(name.to_string(), parse_function_like(params_and_body));
     }
 
     /// Remove a macro definition, leaving a tombstone: the name is now
@@ -180,6 +275,8 @@ impl MacroTable {
             MacroState::Unknown
         } else if self.undefed.contains(name) {
             MacroState::Undefined
+        } else if self.base_defines(name) {
+            MacroState::Defined
         } else if conservative && could_be_predefined(name) {
             MacroState::Unknown
         } else {
@@ -187,15 +284,21 @@ impl MacroTable {
         }
     }
 
-    /// Check whether a macro is defined (for `defined(X)` operator).
+    /// Check whether a macro is definitely defined (for `defined(X)` operator).
     pub fn is_defined(&self, name: &str) -> bool {
-        self.macros.contains_key(name)
+        if self.macros.contains_key(name) {
+            return true;
+        }
+        if self.undefed.contains(name) || self.unknown.contains(name) {
+            return false;
+        }
+        self.base_defines(name)
     }
 
     /// Get the replacement text of an object-like macro.
     /// Returns `None` if undefined, function-like, or defined without a value.
     pub fn get(&self, name: &str) -> Option<&str> {
-        match self.macros.get(name)? {
+        match self.lookup(name)? {
             MacroDef::ObjectLike { value } => value.as_deref(),
             MacroDef::FunctionLike { .. } => None,
         }
@@ -203,27 +306,35 @@ impl MacroTable {
 
     /// Get the macro definition (for function-like expansion).
     pub fn get_def(&self, name: &str) -> Option<&MacroDef> {
-        self.macros.get(name)
+        self.lookup(name)
     }
 
-    /// Save the current definition of a macro onto the stack (`#pragma push_macro`).
+    /// Save the current *effective* definition of a macro onto the stack
+    /// (`#pragma push_macro`), so a later pop restores it whether it came from
+    /// the delta or the base.
     pub fn push_macro(&mut self, name: &str) {
-        let current = self.macros.get(name).cloned();
+        let current = self.lookup(name).cloned();
         self.macro_stack.push((name.to_string(), current));
     }
 
     /// Restore a previously pushed macro definition (`#pragma pop_macro`).
     /// Pop restores the pushed definition as *known* (not tri-state tracked).
     pub fn pop_macro(&mut self, name: &str) {
-        // Search stack from top for matching name
         if let Some(idx) = self.macro_stack.iter().rposition(|(n, _)| n == name) {
             let (_, saved) = self.macro_stack.remove(idx);
+            self.undefed.remove(name);
+            self.unknown.remove(name);
             match saved {
                 Some(def) => {
                     self.macros.insert(name.to_string(), def);
                 }
                 None => {
+                    // Restore to "undefined". A base definition must be
+                    // shadowed by a tombstone; otherwise just drop the delta.
                     self.macros.remove(name);
+                    if self.base_defines(name) {
+                        self.undefed.insert(name.to_string());
+                    }
                 }
             }
         }
@@ -261,7 +372,7 @@ impl MacroTable {
                 continue;
             }
 
-            // String literals — pass through
+            // String literals, pass through
             if bytes[i] == b'"' {
                 let start = i;
                 i += 1;
@@ -278,7 +389,7 @@ impl MacroTable {
                 continue;
             }
 
-            // Character literals — pass through
+            // Character literals, pass through
             if bytes[i] == b'\'' {
                 let start = i;
                 i += 1;
@@ -303,7 +414,7 @@ impl MacroTable {
                 }
                 let ident = &input[start..i];
 
-                // `defined` is special — pass through with its argument unexpanded
+                // `defined` is special, pass through with its argument unexpanded
                 if ident == "defined" {
                     result.push_str("defined");
                     // Skip whitespace
@@ -351,7 +462,7 @@ impl MacroTable {
                     continue;
                 }
 
-                // __has_include is special — pass through unexpanded
+                // __has_include is special, pass through unexpanded
                 if ident == "__has_include" || ident == "__has_include_next" {
                     result.push_str(ident);
                     // Copy everything up to and including the matching ')'
@@ -389,8 +500,8 @@ impl MacroTable {
                     continue;
                 }
 
-                // Look up macro
-                let def = self.macros.get(ident).cloned();
+                // Look up macro (delta shadowing base)
+                let def = self.lookup(ident).cloned();
                 match def {
                     Some(MacroDef::ObjectLike {
                         value: Some(ref val),
@@ -401,7 +512,7 @@ impl MacroTable {
                         result.push_str(&expanded);
                     }
                     Some(MacroDef::ObjectLike { value: None }) => {
-                        // Defined without value — expands to nothing in expression context,
+                        // Defined without value, expands to nothing in expression context,
                         // but for token expansion we keep the identifier
                         result.push_str(ident);
                     }
@@ -444,7 +555,7 @@ impl MacroTable {
                             disabled.remove(ident);
                             result.push_str(&re_expanded);
                         } else {
-                            // No '(' — not a macro invocation, just an identifier
+                            // No '(', not a macro invocation, just an identifier
                             i = saved_i;
                             result.push_str(ident);
                         }
@@ -456,7 +567,7 @@ impl MacroTable {
                 continue;
             }
 
-            // Other characters — pass through
+            // Other characters, pass through
             result.push(bytes[i] as char);
             i += 1;
         }
@@ -497,7 +608,7 @@ fn parse_macro_args(input: &str, pos: &mut usize) -> Vec<String> {
                 *pos += 1;
             }
             b'"' => {
-                // String literal — pass through
+                // String literal, pass through
                 current.push('"');
                 *pos += 1;
                 while *pos < bytes.len() && bytes[*pos] != b'"' {
@@ -536,7 +647,7 @@ fn parse_macro_args(input: &str, pos: &mut usize) -> Vec<String> {
         }
     }
 
-    // Unterminated — push what we have
+    // Unterminated, push what we have
     if !current.is_empty() {
         args.push(current.trim().to_string());
     }
@@ -561,7 +672,7 @@ fn substitute_args(
     let mut i = 0;
 
     while i < bytes.len() {
-        // ## token pasting — uses RAW (unexpanded) args
+        // ## token pasting, uses RAW (unexpanded) args
         if i + 1 < bytes.len() && bytes[i] == b'#' && bytes[i + 1] == b'#' {
             // Trim trailing whitespace from result
             let trimmed_len = result.trim_end().len();
@@ -589,7 +700,7 @@ fn substitute_args(
             continue;
         }
 
-        // # stringification — uses RAW (unexpanded) args
+        // # stringification, uses RAW (unexpanded) args
         if bytes[i] == b'#' {
             i += 1;
             // Skip whitespace
@@ -623,7 +734,7 @@ fn substitute_args(
             continue;
         }
 
-        // Identifier — check if it's a parameter. Uses EXPANDED args.
+        // Identifier, check if it's a parameter. Uses EXPANDED args.
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -640,7 +751,7 @@ fn substitute_args(
             continue;
         }
 
-        // String literals in macro body — pass through without substitution
+        // String literals in macro body, pass through without substitution
         if bytes[i] == b'"' {
             result.push('"');
             i += 1;
@@ -893,10 +1004,10 @@ mod tests {
         t.undef("_WIN32");
         assert_eq!(t.state_of("_WIN32", true), MacroState::Undefined);
         assert_eq!(t.state_of("_WIN32", false), MacroState::Undefined);
-        // mark_unknown beats an earlier tombstone…
+        // mark_unknown beats an earlier tombstone...
         t.mark_unknown("_WIN32");
         assert_eq!(t.state_of("_WIN32", true), MacroState::Unknown);
-        // …and a define clears the tombstone.
+        // ...and a define clears the tombstone.
         t.undef("_LP64");
         t.define("_LP64", None);
         assert_eq!(t.state_of("_LP64", true), MacroState::Defined);
@@ -921,5 +1032,82 @@ mod tests {
         let t = MacroTable::new();
         assert_eq!(t.state_of("FOO", true), MacroState::Undefined);
         assert_eq!(t.state_of("FOO", false), MacroState::Undefined);
+    }
+
+    // -----------------------------------------------------------------------
+    // Base layer (predefs + -D seed, shared across TUs)
+    // -----------------------------------------------------------------------
+
+    fn base_with(defines: &[(&str, Option<&str>)]) -> Arc<MacroBase> {
+        let mut b = MacroBase::new();
+        b.extend_defines(defines.iter().copied());
+        Arc::new(b)
+    }
+
+    #[test]
+    fn base_macros_are_defined_and_expand() {
+        let base = base_with(&[("__GNUC__", Some("15")), ("VERSION", Some("3"))]);
+        let mut t = MacroTable::with_base(base);
+        assert_eq!(t.state_of("__GNUC__", true), MacroState::Defined);
+        assert!(t.is_defined("VERSION"));
+        assert_eq!(t.get("VERSION"), Some("3"));
+        assert_eq!(t.expand("VERSION"), "3");
+    }
+
+    #[test]
+    fn function_like_predefs_carry_through() {
+        let mut b = MacroBase::new();
+        b.define_function_like("SQR", "(x) ((x) * (x))");
+        b.extend_defines([("MAX", Some("(a, b) ((a) > (b) ? (a) : (b))"))]);
+        let mut t = MacroTable::with_base(Arc::new(b));
+        assert_eq!(t.expand("SQR(3)"), "((3) * (3))");
+        assert_eq!(t.expand("MAX(1, 2)"), "((1) > (2) ? (1) : (2))");
+    }
+
+    #[test]
+    fn delta_shadows_and_tombstones_base() {
+        let base = base_with(&[("FOO", Some("1")), ("__linux__", None)]);
+        let mut t = MacroTable::with_base(base);
+        // Redefine shadows the base value.
+        t.define("FOO", Some("2"));
+        assert_eq!(t.get("FOO"), Some("2"));
+        // Undef tombstones even a base define.
+        t.undef("__linux__");
+        assert_eq!(t.state_of("__linux__", true), MacroState::Undefined);
+        assert!(!t.is_defined("__linux__"));
+    }
+
+    #[test]
+    fn clear_keeps_base_drops_delta() {
+        let base = base_with(&[("BASE", Some("1"))]);
+        let mut t = MacroTable::with_base(base);
+        t.define("LOCAL", Some("9"));
+        t.undef("BASE");
+        t.clear();
+        // Delta gone: BASE visible again, LOCAL gone.
+        assert_eq!(t.get("BASE"), Some("1"));
+        assert!(!t.is_defined("LOCAL"));
+    }
+
+    #[test]
+    fn pop_macro_restores_base_via_tombstone() {
+        let base = base_with(&[("M", Some("base"))]);
+        let mut t = MacroTable::with_base(base);
+        t.define("M", Some("delta")); // shadow
+        t.push_macro("M"); // save "delta"
+        t.undef("M"); // now undefined
+        assert!(!t.is_defined("M"));
+        t.pop_macro("M"); // restore "delta"
+        assert_eq!(t.get("M"), Some("delta"));
+
+        // Push an undefined-from-base name, define, then pop back to base-undefined.
+        t.undef("M");
+        t.push_macro("M"); // saves None (tombstoned)
+        t.define("M", Some("x"));
+        t.pop_macro("M");
+        assert!(
+            !t.is_defined("M"),
+            "pop should restore the tombstone over base"
+        );
     }
 }

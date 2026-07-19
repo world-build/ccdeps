@@ -1,117 +1,34 @@
-//! Dependency graph construction.
+//! Dependency graph walk.
 //!
-//! Builds the transitive dependency graph for a translation unit by
-//! recursively resolving includes. Uses include guard / `#pragma once`
-//! detection to avoid re-processing files.
-//!
-//! Evaluates `#if`/`#ifdef`/`#ifndef` conditionals using the macro table
-//! and Pratt evaluator so that only the taken branch's includes are followed.
+//! Walks a translation unit's include closure, following only the taken branch
+//! of each conditional (or, in conservative mode, both branches of an
+//! unknown one). The heavy per-file state lives in the [`ScanService`] (content
+//! cache) and the reusable [`ScanScratch`](crate::ScanScratch); this module is
+//! the traversal that ties them together and classifies each edge into the
+//! [`ScanOutput`].
 
-use dashmap::DashMap;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::directive::{self, Directive, IncludeDirective, IncludeStyle};
 use crate::eval::{self, Cond};
-use crate::intern::PathInterner;
+use crate::intern::{ContentHash, FileId};
 use crate::macros::{MacroState, MacroTable};
-use crate::minimize::{self, MinimizeOptions};
-use crate::resolve::{ResolvedInclude, SearchPaths};
-use crate::vfs::Vfs;
+use crate::minimize;
+use crate::resolve::ResolvedInclude;
+use crate::service::{FileInfo, ScanEnv, ScanOutput, ScanService, Visited};
 
-/// Cached information about a scanned file.
-#[derive(Debug)]
-pub struct FileInfo {
-    /// Minimized source content.
-    pub minimized: minimize::MinimizedSource,
-    /// Original file size (for stats).
-    pub original_size: usize,
+/// Immutable references shared across the whole walk. Bundling them keeps the
+/// mutable state (`macros`, `visited`, `cond_stack`, `out`, `observe`) as
+/// separate `&mut` bindings so the borrow checker sees them as disjoint.
+pub(crate) struct Ctx<'a> {
+    pub service: &'a ScanService,
+    pub env: &'a ScanEnv<'a>,
+    pub vfs: &'a dyn crate::vfs::Vfs,
 }
 
-/// A dependency entry with metadata about how it was resolved.
-#[derive(Debug, Clone)]
-pub struct DepEntry {
-    /// The canonical file path (interned, used for deduplication).
-    pub path: Arc<Path>,
-    /// The path to display in output (preserves `../` and `./` as gcc does).
-    /// If `None`, `path` is used for display.
-    pub display_path: Option<PathBuf>,
-    /// Whether this dependency was found via a system include path (`-isystem`).
-    pub is_system: bool,
-    /// `Some(style)` for unresolved headers recorded via the `-MG` missing
-    /// path (post-expansion style for computed includes); `None` for every
-    /// resolved dependency.
-    pub missing_style: Option<crate::directive::IncludeStyle>,
-}
-
-/// Thread-safe cache of scanned files.
-pub type FileCache = Arc<DashMap<PathBuf, Arc<FileInfo>>>;
-
-/// Options for dependency collection.
-#[derive(Debug, Clone, Default)]
-pub struct DepCollectOptions {
-    /// Treat missing headers as generated (`-MG`).
-    pub missing_as_generated: bool,
-    /// Process trigraphs in source files.
-    pub trigraphs: bool,
-    /// Conservative mode: conditionals on unknown macros (names the compiler
-    /// might predefine, or names defined/undefined in maybe-taken branches)
-    /// follow BOTH branches, producing a sound superset of the include set.
-    pub conservative: bool,
-}
-
-/// Create a new empty file cache.
-pub fn new_file_cache() -> FileCache {
-    Arc::new(DashMap::new())
-}
-
-/// Build the dependency set for a single translation unit.
-///
-/// Returns the list of all files (headers) that the source transitively depends on.
-/// `initial_defines` provides command-line `-D` definitions.
-pub fn collect_deps(
-    source_path: &Path,
-    vfs: &dyn Vfs,
-    search_paths: &SearchPaths,
-    cache: &FileCache,
-    initial_defines: &[(String, Option<String>)],
-    options: &DepCollectOptions,
-) -> Result<Vec<DepEntry>, std::io::Error> {
-    let mut deps = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut macros = MacroTable::new();
-    let interner = PathInterner::new();
-    let mut import_once = std::collections::HashSet::new();
-    let minimize_opts = MinimizeOptions {
-        trigraphs: options.trigraphs,
-    };
-
-    // Apply command-line defines
-    for (name, value) in initial_defines {
-        macros.define(name, value.as_deref());
-    }
-
-    let canonical = vfs.canonicalize(source_path)?;
-    visited.insert(canonical.clone());
-
-    collect_deps_recursive(
-        &canonical,
-        vfs,
-        search_paths,
-        cache,
-        &mut deps,
-        &mut visited,
-        &mut macros,
-        &interner,
-        &mut import_once,
-        options,
-        &minimize_opts,
-        false, // is_system_header
-        None,  // display_dir (root file has no display override)
-    )?;
-
-    Ok(deps)
-}
+/// The observe callback: fired once per file whose content a TU depends on.
+type Observe<'o> = dyn FnMut(FileId, ContentHash) + 'o;
 
 // ---------------------------------------------------------------------------
 // Conditional stack
@@ -119,124 +36,110 @@ pub fn collect_deps(
 
 /// State for one level of `#if`/`#ifdef`/`#ifndef` nesting.
 ///
-/// In exact mode conditions are never [`Cond::Unknown`], so `active` follows
-/// exactly one branch per chain, reproducing the historical behavior. In
-/// conservative mode an Unknown condition leaves a branch active (maybe
-/// taken) without marking it definitely taken, so later branches of the
-/// chain stay active too — both sides contribute dependencies.
-struct ConditionalState {
+/// In exact mode a condition is never [`Cond::Unknown`], so `active` follows
+/// exactly one branch per chain. In conservative mode an Unknown condition
+/// leaves a branch active (maybe-taken) without marking it definitely taken, so
+/// later branches stay active too and both sides contribute dependencies.
+pub(crate) struct ConditionalState {
     /// A branch in this chain has DEFINITELY been taken (True condition).
     definitely_taken: bool,
-    /// All conditions seen so far in this chain were definitely False.
+    /// Every condition seen so far in this chain was definitely False.
     all_prior_false: bool,
-    /// Current branch should be processed (may = maybe-taken).
+    /// The current branch should be processed (maybe- or definitely-taken).
     active: bool,
-    /// Current branch is CERTAINLY the one real compilation takes.
+    /// The current branch is CERTAINLY the one real compilation takes.
     certain: bool,
     parent_active: bool,
     parent_certain: bool,
 }
 
-struct ConditionalStack {
-    stack: Vec<ConditionalState>,
+/// One file's conditionals occupy `cstack[base..]`; `base` is the stack length
+/// when the file's walk began, so nested includes don't see each other's
+/// conditionals. `last()` of that slice is the current level (or none → active).
+fn cond_active(cstack: &[ConditionalState], base: usize) -> bool {
+    cstack[base..].last().is_none_or(|s| s.active)
 }
 
-impl ConditionalStack {
-    fn new() -> Self {
-        Self { stack: Vec::new() }
-    }
+fn cond_certain(cstack: &[ConditionalState], base: usize) -> bool {
+    cstack[base..].last().is_none_or(|s| s.certain)
+}
 
-    /// Whether directives at the current position should be processed.
-    fn is_active(&self) -> bool {
-        self.stack.last().is_none_or(|s| s.active)
-    }
+fn cond_push_if(cstack: &mut Vec<ConditionalState>, base: usize, condition: Cond) {
+    let parent_active = cond_active(cstack, base);
+    let parent_certain = cond_certain(cstack, base);
+    let active = parent_active && condition != Cond::False;
+    cstack.push(ConditionalState {
+        definitely_taken: parent_active && condition == Cond::True,
+        all_prior_false: condition == Cond::False,
+        active,
+        certain: parent_certain && condition == Cond::True,
+        parent_active,
+        parent_certain,
+    });
+}
 
-    /// Whether every enclosing branch is certainly the one real compilation
-    /// takes (true at the top level).
-    fn is_certain(&self) -> bool {
-        self.stack.last().is_none_or(|s| s.certain)
+fn cond_elif(cstack: &mut [ConditionalState], base: usize, condition: Cond) {
+    if cstack.len() <= base {
+        return;
     }
-
-    fn push_if(&mut self, condition: Cond) {
-        let parent_active = self.is_active();
-        let parent_certain = self.is_certain();
-        let active = parent_active && condition != Cond::False;
-        self.stack.push(ConditionalState {
-            definitely_taken: parent_active && condition == Cond::True,
-            all_prior_false: condition == Cond::False,
-            active,
-            certain: parent_certain && condition == Cond::True,
-            parent_active,
-            parent_certain,
-        });
+    let state = cstack.last_mut().unwrap();
+    if state.definitely_taken || !state.parent_active {
+        state.active = false;
+        state.certain = false;
+    } else {
+        state.active = condition != Cond::False;
+        state.certain = state.parent_certain && state.all_prior_false && condition == Cond::True;
+        state.definitely_taken |= condition == Cond::True;
+        state.all_prior_false &= condition == Cond::False;
     }
+}
 
-    fn handle_elif(&mut self, condition: Cond) {
-        if let Some(state) = self.stack.last_mut() {
-            if state.definitely_taken || !state.parent_active {
-                state.active = false;
-                state.certain = false;
-            } else {
-                state.active = condition != Cond::False;
-                state.certain =
-                    state.parent_certain && state.all_prior_false && condition == Cond::True;
-                state.definitely_taken |= condition == Cond::True;
-                state.all_prior_false &= condition == Cond::False;
-            }
-        }
+fn cond_else(cstack: &mut [ConditionalState], base: usize) {
+    if cstack.len() <= base {
+        return;
     }
+    let state = cstack.last_mut().unwrap();
+    state.active = state.parent_active && !state.definitely_taken;
+    state.certain = state.parent_certain && state.all_prior_false;
+    state.definitely_taken = true;
+}
 
-    fn handle_else(&mut self) {
-        if let Some(state) = self.stack.last_mut() {
-            state.active = state.parent_active && !state.definitely_taken;
-            state.certain = state.parent_certain && state.all_prior_false;
-            state.definitely_taken = true;
-        }
-    }
-
-    fn pop_endif(&mut self) {
-        self.stack.pop();
+fn cond_endif(cstack: &mut Vec<ConditionalState>, base: usize) {
+    if cstack.len() > base {
+        cstack.pop();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Recursive dependency collection
+// Walk
 // ---------------------------------------------------------------------------
 
+/// Walk one already-loaded file, following its directives. `info` is the file's
+/// cached minimized form; `path` is its canonical path; `display_dir` carries a
+/// non-canonical apparent directory for gcc-style display paths (CLI only).
 #[allow(clippy::too_many_arguments)]
-fn collect_deps_recursive(
-    file_path: &Path,
-    vfs: &dyn Vfs,
-    search_paths: &SearchPaths,
-    cache: &FileCache,
-    deps: &mut Vec<DepEntry>,
-    visited: &mut std::collections::HashSet<PathBuf>,
+pub(crate) fn walk_file(
+    ctx: &Ctx,
     macros: &mut MacroTable,
-    interner: &PathInterner,
-    import_once: &mut std::collections::HashSet<PathBuf>,
-    options: &DepCollectOptions,
-    minimize_opts: &MinimizeOptions,
-    mut is_system_header: bool,
+    visited: &mut Visited,
+    cstack: &mut Vec<ConditionalState>,
+    out: &mut ScanOutput,
+    observe: &mut Observe,
+    info: &FileInfo,
+    path: &Path,
+    mut is_system: bool,
     display_dir: Option<&Path>,
-) -> Result<(), std::io::Error> {
-    let info = get_or_scan(file_path, vfs, cache, minimize_opts)?;
+) {
+    let base = cstack.len();
+    let current_dir = path.parent().unwrap_or(Path::new("."));
 
-    let content = String::from_utf8_lossy(&info.minimized.content);
-    let mut cond_stack = ConditionalStack::new();
-    let current_dir = file_path.parent().unwrap_or(Path::new("."));
-    let eval_ctx = eval::EvalContext {
-        search_paths,
-        current_file_dir: current_dir,
-        vfs,
-    };
-
-    for line in content.lines() {
+    for line in info.directives.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
-        // Join line continuations so split keywords like `#inc\nlude` work
+        // Join split keywords like `#inc\nlude` (rare; see minimize).
         let joined;
         let line = if line.contains("\\\n") {
             joined = minimize::join_line_continuations(line);
@@ -250,21 +153,26 @@ fn collect_deps_recursive(
             None => continue,
         };
 
-        // Conditional directives must always be processed (for nesting tracking),
-        // even when we're in a skipped branch.
+        // Conditional directives are always processed (to track nesting), even
+        // in a skipped branch.
         match directive {
             Directive::If { expr } => {
-                let condition = if cond_stack.is_active() {
-                    eval::evaluate_cond(expr, macros, &eval_ctx, options.conservative)
+                let condition = if cond_active(cstack, base) {
+                    let eval_ctx = eval::EvalContext {
+                        search_paths: ctx.env.search_paths,
+                        current_file_dir: current_dir,
+                        vfs: ctx.vfs,
+                    };
+                    eval::evaluate_cond(expr, macros, &eval_ctx, ctx.env.conservative)
                 } else {
                     Cond::False
                 };
-                cond_stack.push_if(condition);
+                cond_push_if(cstack, base, condition);
                 continue;
             }
             Directive::Ifdef { name } => {
-                let condition = if cond_stack.is_active() {
-                    match macros.state_of(name, options.conservative) {
+                let condition = if cond_active(cstack, base) {
+                    match macros.state_of(name, ctx.env.conservative) {
                         MacroState::Defined => Cond::True,
                         MacroState::Undefined => Cond::False,
                         MacroState::Unknown => Cond::Unknown,
@@ -272,21 +180,19 @@ fn collect_deps_recursive(
                 } else {
                     Cond::False
                 };
-                cond_stack.push_if(condition);
+                cond_push_if(cstack, base, condition);
                 continue;
             }
             Directive::Ifndef { name } => {
-                let condition = if cond_stack.is_active() {
-                    match macros.state_of(name, options.conservative) {
+                let condition = if cond_active(cstack, base) {
+                    match macros.state_of(name, ctx.env.conservative) {
                         MacroState::Defined => Cond::False,
                         MacroState::Undefined => Cond::True,
                         // Own-guard rule: a header's own include guard is
-                        // assumed not to be a compiler predef — treat the
-                        // guard branch as certainly taken so the `#define`s
-                        // in its body stay tracked.
-                        MacroState::Unknown
-                            if info.minimized.guard_macro.as_deref() == Some(name) =>
-                        {
+                        // assumed not to be a compiler predef, so treat the
+                        // guard branch as certainly taken to keep its body's
+                        // `#define`s tracked.
+                        MacroState::Unknown if info.guard_macro.as_deref() == Some(name) => {
                             Cond::True
                         }
                         MacroState::Unknown => Cond::Unknown,
@@ -294,35 +200,42 @@ fn collect_deps_recursive(
                 } else {
                     Cond::False
                 };
-                cond_stack.push_if(condition);
+                cond_push_if(cstack, base, condition);
                 continue;
             }
             Directive::Elif { expr } => {
-                let condition = eval::evaluate_cond(expr, macros, &eval_ctx, options.conservative);
-                cond_stack.handle_elif(condition);
+                let condition = {
+                    let eval_ctx = eval::EvalContext {
+                        search_paths: ctx.env.search_paths,
+                        current_file_dir: current_dir,
+                        vfs: ctx.vfs,
+                    };
+                    eval::evaluate_cond(expr, macros, &eval_ctx, ctx.env.conservative)
+                };
+                cond_elif(cstack, base, condition);
                 continue;
             }
             Directive::Else => {
-                cond_stack.handle_else();
+                cond_else(cstack, base);
                 continue;
             }
             Directive::Endif => {
-                cond_stack.pop_endif();
+                cond_endif(cstack, base);
                 continue;
             }
             _ => {}
         }
 
-        // All other directives are only processed when active.
-        if !cond_stack.is_active() {
+        // Everything else is only processed in an active branch.
+        if !cond_active(cstack, base) {
             continue;
         }
 
         match directive {
             Directive::Define { name, value } => {
-                if options.conservative && !cond_stack.is_certain() {
-                    // Defined inside a branch we're not sure is taken: the
-                    // macro's real state now depends on that branch.
+                if ctx.env.conservative && !cond_certain(cstack, base) {
+                    // Defined inside a maybe-taken branch: its real state now
+                    // depends on that branch.
                     macros.mark_unknown(name);
                 } else if let Some(val) = value {
                     if val.starts_with('(') {
@@ -335,161 +248,248 @@ fn collect_deps_recursive(
                 }
             }
             Directive::Undef { name } => {
-                if options.conservative && !cond_stack.is_certain() {
+                if ctx.env.conservative && !cond_certain(cstack, base) {
                     macros.mark_unknown(name);
                 } else {
                     macros.undef(name);
                 }
             }
             Directive::Pragma { tokens } => {
-                handle_pragma(tokens, macros, &mut is_system_header);
+                handle_pragma(tokens, macros, &mut is_system);
             }
             Directive::Include(ref inc) => {
                 handle_include(
-                    inc,
-                    file_path,
-                    vfs,
-                    search_paths,
-                    cache,
-                    deps,
-                    visited,
+                    ctx,
                     macros,
-                    interner,
-                    import_once,
-                    options,
-                    minimize_opts,
-                    is_system_header,
-                    false, // is_import
-                    display_dir,
-                )?;
-            }
-            Directive::IncludeNext(ref inc) => {
-                // #include_next: resolve starting from the next search directory
-                let resolved = search_paths.resolve_include_next(inc.path, current_dir, vfs);
-                if let Some(ResolvedInclude {
-                    path: resolved_path,
+                    visited,
+                    cstack,
+                    out,
+                    observe,
+                    inc,
+                    path,
+                    current_dir,
                     is_system,
-                    display_path,
-                }) = resolved
-                {
-                    process_resolved_include(
-                        &resolved_path,
-                        is_system || is_system_header,
-                        display_path,
-                        vfs,
-                        search_paths,
-                        cache,
-                        deps,
-                        visited,
-                        macros,
-                        interner,
-                        import_once,
-                        options,
-                        minimize_opts,
-                        false,
-                    )?;
-                } else if options.missing_as_generated {
-                    add_missing_dep(inc.path, inc.style, deps, interner);
-                }
+                    display_dir,
+                );
             }
             Directive::Import(ref inc) => {
+                // #import is include-once; the visited-set already gives every
+                // file once-only semantics, so it is handled like #include.
                 handle_include(
-                    inc,
-                    file_path,
-                    vfs,
-                    search_paths,
-                    cache,
-                    deps,
-                    visited,
+                    ctx,
                     macros,
-                    interner,
-                    import_once,
-                    options,
-                    minimize_opts,
-                    is_system_header,
-                    true, // is_import
+                    visited,
+                    cstack,
+                    out,
+                    observe,
+                    inc,
+                    path,
+                    current_dir,
+                    is_system,
                     display_dir,
-                )?;
+                );
+            }
+            Directive::IncludeNext(ref inc) => {
+                let resolved =
+                    ctx.env
+                        .search_paths
+                        .resolve_include_next(inc.path, current_dir, ctx.vfs);
+                if let Some(r) = resolved {
+                    process_resolved(
+                        ctx,
+                        macros,
+                        visited,
+                        cstack,
+                        out,
+                        observe,
+                        &r.path,
+                        r.is_system || is_system,
+                        r.display_path,
+                        true,
+                    );
+                } else if ctx.env.missing_as_generated {
+                    out.push_unresolved(inc.path, inc.style == IncludeStyle::Angle);
+                }
             }
             Directive::Embed(ref inc) => {
-                // #embed is like #include for dependency purposes — resolve and add
-                // to deps, but don't recurse (it embeds binary data, not source).
-                let mut missing_style = inc.style;
-                let resolved = match inc.style {
-                    IncludeStyle::Quoted => {
-                        let dir = file_path.parent().unwrap_or(Path::new("."));
-                        search_paths.resolve_quoted(inc.path, dir, display_dir, vfs)
-                    }
-                    IncludeStyle::Angle => search_paths.resolve_angle(inc.path, vfs),
-                    IncludeStyle::Computed => {
-                        let expanded = macros.expand(inc.path);
-                        let expanded = expanded.trim().to_string();
-                        if let Some(path) = extract_include_path(&expanded) {
-                            let is_angle = expanded.starts_with('<');
-                            missing_style = if is_angle {
-                                IncludeStyle::Angle
-                            } else {
-                                IncludeStyle::Quoted
-                            };
-                            if is_angle {
-                                search_paths.resolve_angle(&path, vfs)
-                            } else {
-                                let dir = file_path.parent().unwrap_or(Path::new("."));
-                                search_paths.resolve_quoted(&path, dir, display_dir, vfs)
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                };
-                if let Some(ResolvedInclude {
-                    path: resolved_path,
-                    is_system,
-                    display_path: res_display,
-                }) = resolved
-                {
-                    let canonical = match vfs.canonicalize(&resolved_path) {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    let display_path = res_display.or_else(|| {
-                        if resolved_path != canonical {
-                            Some(resolved_path)
-                        } else {
-                            None
-                        }
-                    });
-                    let interned_path = interner.intern(&canonical);
-                    if !deps.iter().any(|d| *d.path == *interned_path) {
-                        deps.push(DepEntry {
-                            path: interned_path,
-                            display_path,
-                            is_system: is_system || is_system_header,
-                            missing_style: None,
-                        });
-                    }
-                } else if options.missing_as_generated {
-                    add_missing_dep(inc.path, missing_style, deps, interner);
+                // #embed adds a dependency but does not recurse (binary data).
+                let (resolved, style) = resolve_include(ctx, macros, inc, current_dir, display_dir);
+                if let Some(r) = resolved {
+                    process_resolved(
+                        ctx,
+                        macros,
+                        visited,
+                        cstack,
+                        out,
+                        observe,
+                        &r.path,
+                        r.is_system || is_system,
+                        r.display_path,
+                        false,
+                    );
+                } else if ctx.env.missing_as_generated {
+                    out.push_unresolved(inc.path, style == IncludeStyle::Angle);
                 }
             }
             _ => {}
         }
     }
 
-    Ok(())
+    cstack.truncate(base);
 }
 
-/// Handle `#pragma` directives that affect dependency scanning.
-fn handle_pragma(tokens: &str, macros: &mut MacroTable, is_system_header: &mut bool) {
-    let tokens = tokens.trim();
+/// Resolve an `#include`/`#import`/`#embed` directive to a file, expanding a
+/// computed include first. Returns the post-expansion style so an unresolved
+/// include is bucketed correctly (`<...>` → toolchain, `"..."` → generated).
+fn resolve_include(
+    ctx: &Ctx,
+    macros: &mut MacroTable,
+    inc: &IncludeDirective<'_>,
+    current_dir: &Path,
+    display_dir: Option<&Path>,
+) -> (Option<ResolvedInclude>, IncludeStyle) {
+    let sp = ctx.env.search_paths;
+    match inc.style {
+        IncludeStyle::Quoted => (
+            sp.resolve_quoted(inc.path, current_dir, display_dir, ctx.vfs),
+            IncludeStyle::Quoted,
+        ),
+        IncludeStyle::Angle => (sp.resolve_angle(inc.path, ctx.vfs), IncludeStyle::Angle),
+        IncludeStyle::Computed => {
+            let expanded = macros.expand(inc.path);
+            let expanded = expanded.trim();
+            match extract_include_path(expanded) {
+                Some(path) if expanded.starts_with('<') => {
+                    (sp.resolve_angle(&path, ctx.vfs), IncludeStyle::Angle)
+                }
+                Some(path) => (
+                    sp.resolve_quoted(&path, current_dir, display_dir, ctx.vfs),
+                    IncludeStyle::Quoted,
+                ),
+                None => (None, IncludeStyle::Computed),
+            }
+        }
+    }
+}
 
-    // #pragma GCC system_header
-    if tokens == "GCC system_header" || tokens == "clang system_header" {
-        *is_system_header = true;
+/// Handle an `#include` / `#import`.
+#[allow(clippy::too_many_arguments)]
+fn handle_include(
+    ctx: &Ctx,
+    macros: &mut MacroTable,
+    visited: &mut Visited,
+    cstack: &mut Vec<ConditionalState>,
+    out: &mut ScanOutput,
+    observe: &mut Observe,
+    inc: &IncludeDirective<'_>,
+    _file_path: &Path,
+    current_dir: &Path,
+    is_system: bool,
+    display_dir: Option<&Path>,
+) {
+    let (resolved, style) = resolve_include(ctx, macros, inc, current_dir, display_dir);
+    if let Some(r) = resolved {
+        process_resolved(
+            ctx,
+            macros,
+            visited,
+            cstack,
+            out,
+            observe,
+            &r.path,
+            r.is_system || is_system,
+            r.display_path,
+            true,
+        );
+    } else if ctx.env.missing_as_generated {
+        out.push_unresolved(inc.path, style == IncludeStyle::Angle);
+    }
+}
+
+/// Record a resolved include and, unless it is guard-dominated or `recurse` is
+/// false, walk into it. The single choke point where a file is canonicalized,
+/// interned, deduped, observed, and classified.
+#[allow(clippy::too_many_arguments)]
+fn process_resolved(
+    ctx: &Ctx,
+    macros: &mut MacroTable,
+    visited: &mut Visited,
+    cstack: &mut Vec<ConditionalState>,
+    out: &mut ScanOutput,
+    observe: &mut Observe,
+    resolved_path: &Path,
+    is_system: bool,
+    resolved_display: Option<PathBuf>,
+    recurse: bool,
+) {
+    let canonical: Cow<Path> = if ctx.env.trust_canonical {
+        Cow::Borrowed(resolved_path)
+    } else {
+        match ctx.vfs.canonicalize(resolved_path) {
+            Ok(c) => Cow::Owned(c),
+            Err(_) => return,
+        }
+    };
+
+    let file = ctx.service.intern(&canonical);
+    if visited.is_visited(file) {
         return;
     }
 
-    // #pragma push_macro("name")
+    let info = match ctx.service.get_or_scan(file, &canonical, ctx.vfs) {
+        Ok(info) => info,
+        Err(_) => return,
+    };
+
+    let display: Option<Box<str>> = if ctx.env.record_display {
+        resolved_display
+            .as_deref()
+            .map(path_to_boxed)
+            .or_else(|| (resolved_path != &*canonical).then(|| path_to_boxed(resolved_path)))
+    } else {
+        None
+    };
+
+    // Mark visited before observing/recording so re-encounters this TU dedup.
+    visited.mark(file);
+    observe(file, info.content_hash);
+    out.push_resolved(file, is_system, display);
+
+    if !recurse || info.is_dominated(macros) {
+        return;
+    }
+
+    let child_display_dir = if ctx.env.record_display {
+        resolved_display
+            .as_ref()
+            .and_then(|dp| dp.parent().map(Path::to_path_buf))
+    } else {
+        None
+    };
+
+    walk_file(
+        ctx,
+        macros,
+        visited,
+        cstack,
+        out,
+        observe,
+        &info,
+        &canonical,
+        is_system,
+        child_display_dir.as_deref(),
+    );
+}
+
+/// Handle `#pragma` directives that affect scanning.
+fn handle_pragma(tokens: &str, macros: &mut MacroTable, is_system: &mut bool) {
+    let tokens = tokens.trim();
+
+    if tokens == "GCC system_header" || tokens == "clang system_header" {
+        *is_system = true;
+        return;
+    }
+
     if let Some(rest) = tokens.strip_prefix("push_macro") {
         if let Some(name) = extract_pragma_macro_name(rest) {
             macros.push_macro(name);
@@ -497,7 +497,6 @@ fn handle_pragma(tokens: &str, macros: &mut MacroTable, is_system_header: &mut b
         return;
     }
 
-    // #pragma pop_macro("name")
     if let Some(rest) = tokens.strip_prefix("pop_macro") {
         if let Some(name) = extract_pragma_macro_name(rest) {
             macros.pop_macro(name);
@@ -505,310 +504,107 @@ fn handle_pragma(tokens: &str, macros: &mut MacroTable, is_system_header: &mut b
     }
 }
 
-/// Extract macro name from `("name")` in pragma push_macro/pop_macro.
 fn extract_pragma_macro_name(s: &str) -> Option<&str> {
-    let s = s.trim();
-    let s = s.strip_prefix('(')?;
-    let s = s.trim();
-    let s = s.strip_prefix('"')?;
+    let s = s.trim().strip_prefix('(')?.trim().strip_prefix('"')?;
     let end = s.find('"')?;
     Some(&s[..end])
 }
 
-/// Handle an `#include` or `#import` directive.
-#[allow(clippy::too_many_arguments)]
-fn handle_include(
-    inc: &IncludeDirective<'_>,
-    file_path: &Path,
-    vfs: &dyn Vfs,
-    search_paths: &SearchPaths,
-    cache: &FileCache,
-    deps: &mut Vec<DepEntry>,
-    visited: &mut std::collections::HashSet<PathBuf>,
-    macros: &mut MacroTable,
-    interner: &PathInterner,
-    import_once: &mut std::collections::HashSet<PathBuf>,
-    options: &DepCollectOptions,
-    minimize_opts: &MinimizeOptions,
-    is_system_header: bool,
-    is_import: bool,
-    display_dir: Option<&Path>,
-) -> Result<(), std::io::Error> {
-    let mut missing_style = inc.style;
-    let resolved = match inc.style {
-        IncludeStyle::Quoted => {
-            let dir = file_path.parent().unwrap_or(Path::new("."));
-            search_paths.resolve_quoted(inc.path, dir, display_dir, vfs)
-        }
-        IncludeStyle::Angle => search_paths.resolve_angle(inc.path, vfs),
-        IncludeStyle::Computed => {
-            let expanded = macros.expand(inc.path);
-            let expanded = expanded.trim().to_string();
-            if let Some(path) = extract_include_path(&expanded) {
-                let is_angle = expanded.starts_with('<');
-                missing_style = if is_angle {
-                    IncludeStyle::Angle
-                } else {
-                    IncludeStyle::Quoted
-                };
-                if is_angle {
-                    search_paths.resolve_angle(&path, vfs)
-                } else {
-                    let dir = file_path.parent().unwrap_or(Path::new("."));
-                    search_paths.resolve_quoted(&path, dir, display_dir, vfs)
-                }
-            } else {
-                return Ok(());
-            }
-        }
-    };
-
-    if let Some(ResolvedInclude {
-        path: resolved_path,
-        is_system,
-        display_path,
-    }) = resolved
-    {
-        process_resolved_include(
-            &resolved_path,
-            is_system || is_system_header,
-            display_path,
-            vfs,
-            search_paths,
-            cache,
-            deps,
-            visited,
-            macros,
-            interner,
-            import_once,
-            options,
-            minimize_opts,
-            is_import,
-        )?;
-    } else if options.missing_as_generated {
-        add_missing_dep(inc.path, missing_style, deps, interner);
-    }
-
-    Ok(())
-}
-
-/// Process a resolved include path: check guards, add to deps, recurse.
-#[allow(clippy::too_many_arguments)]
-fn process_resolved_include(
-    resolved_path: &Path,
-    is_system: bool,
-    resolved_display: Option<PathBuf>,
-    vfs: &dyn Vfs,
-    search_paths: &SearchPaths,
-    cache: &FileCache,
-    deps: &mut Vec<DepEntry>,
-    visited: &mut std::collections::HashSet<PathBuf>,
-    macros: &mut MacroTable,
-    interner: &PathInterner,
-    import_once: &mut std::collections::HashSet<PathBuf>,
-    options: &DepCollectOptions,
-    minimize_opts: &MinimizeOptions,
-    is_import: bool,
-) -> Result<(), std::io::Error> {
-    let canonical = match vfs.canonicalize(resolved_path) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-
-    // Use the display path from resolution if available, otherwise fall back
-    // to the resolved path if it differs from canonical.
-    let display_path = resolved_display.or_else(|| {
-        if resolved_path != canonical {
-            Some(resolved_path.to_path_buf())
-        } else {
-            None
-        }
-    });
-
-    // #import: skip if already imported
-    if import_once.contains(&canonical) {
-        let interned = interner.intern(&canonical);
-        if !deps.iter().any(|d| *d.path == *interned) {
-            deps.push(DepEntry {
-                path: interned,
-                display_path: display_path.clone(),
-                is_system,
-                missing_style: None,
-            });
-        }
-        return Ok(());
-    }
-
-    if visited.contains(&canonical) {
-        return Ok(());
-    }
-
-    // Check include guard / pragma once
-    if let Some(cached) = cache.get(&canonical) {
-        let dominated = if cached.minimized.has_pragma_once {
-            true
-        } else if cached.minimized.has_include_guard {
-            if let Some(ref guard) = cached.minimized.guard_macro {
-                macros.is_defined(guard)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if dominated {
-            let interned = interner.intern(&canonical);
-            if !deps.iter().any(|d| *d.path == *interned) {
-                deps.push(DepEntry {
-                    path: interned,
-                    display_path: display_path.clone(),
-                    is_system,
-                    missing_style: None,
-                });
-            }
-            return Ok(());
-        }
-    }
-
-    visited.insert(canonical.clone());
-
-    // Mark as import-once if this is #import
-    if is_import {
-        import_once.insert(canonical.clone());
-    }
-
-    let interned = interner.intern_owned(canonical.clone());
-    deps.push(DepEntry {
-        path: interned,
-        display_path: display_path.clone(),
-        is_system,
-        missing_style: None,
-    });
-
-    // Compute the "apparent directory" for this file based on its display path.
-    // This propagates non-canonical path segments (e.g., `inc/..`) so that
-    // further includes from this file get correct display paths.
-    let child_display_dir = display_path
-        .as_ref()
-        .and_then(|dp| dp.parent().map(|p| p.to_path_buf()));
-
-    collect_deps_recursive(
-        &canonical,
-        vfs,
-        search_paths,
-        cache,
-        deps,
-        visited,
-        macros,
-        interner,
-        import_once,
-        options,
-        minimize_opts,
-        is_system,
-        child_display_dir.as_deref(),
-    )?;
-
-    Ok(())
-}
-
-/// Add a missing header as a generated dependency (`-MG`).
-///
-/// `style` records how the header was requested (post-expansion style for
-/// computed includes, or `Computed` when the expansion was undeterminable).
-fn add_missing_dep(
-    path: &str,
-    style: IncludeStyle,
-    deps: &mut Vec<DepEntry>,
-    interner: &PathInterner,
-) {
-    let p = Path::new(path);
-    let interned = interner.intern(p);
-    if !deps.iter().any(|d| *d.path == *interned) {
-        deps.push(DepEntry {
-            path: interned,
-            display_path: None,
-            is_system: false,
-            missing_style: Some(style),
-        });
-    }
-}
-
-/// Extract the path from an expanded include token sequence.
-/// Handles `"path"` and `<path>` forms.
+/// Extract the path from an expanded computed-include token sequence
+/// (`"path"` or `<path>`).
 fn extract_include_path(expanded: &str) -> Option<String> {
     let s = expanded.trim();
-    let is_quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
-    let is_angle = s.starts_with('<') && s.ends_with('>') && s.len() >= 2;
-    if is_quoted || is_angle {
-        Some(s[1..s.len() - 1].to_string())
-    } else {
-        None
-    }
+    let quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
+    let angle = s.starts_with('<') && s.ends_with('>') && s.len() >= 2;
+    (quoted || angle).then(|| s[1..s.len() - 1].to_string())
 }
 
-/// Get file info from cache, or scan and cache it.
-///
-/// File contents are read through the [`Vfs`], which for the real filesystem
-/// uses memory-mapped I/O for files >= 4 KB (avoids the allocation of
-/// `std::fs::read`) and plain `read` for smaller files (avoids mmap's fixed
-/// VMA setup overhead).
-fn get_or_scan(
-    path: &Path,
-    vfs: &dyn Vfs,
-    cache: &FileCache,
-    minimize_opts: &MinimizeOptions,
-) -> Result<Arc<FileInfo>, std::io::Error> {
-    if let Some(info) = cache.get(path) {
-        return Ok(Arc::clone(&info));
-    }
-
-    let source = vfs.read(path)?;
-    let minimized = minimize::minimize_with_options(&source, minimize_opts);
-
-    let info = Arc::new(FileInfo {
-        minimized,
-        original_size: source.len(),
-    });
-
-    cache.insert(path.to_path_buf(), Arc::clone(&info));
-    Ok(info)
+fn path_to_boxed(p: &Path) -> Box<str> {
+    p.to_string_lossy().as_ref().into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macros::MacroBase;
+    use crate::resolve::SearchPaths;
+    use crate::service::{ScanEnv, ScanOutput, ScanScratch, ScanService};
     use crate::vfs::OsVfs;
     use std::fs;
+    use std::sync::Arc;
+
+    fn base_from(defines: &[(String, Option<String>)]) -> Arc<MacroBase> {
+        let mut base = MacroBase::new();
+        base.extend_defines(defines.iter().map(|(n, v)| (n.as_str(), v.as_deref())));
+        Arc::new(base)
+    }
+
+    /// Scan `main.c` in `dir`, returning dependency file basenames in order.
+    fn scan_names(
+        dir: &Path,
+        defines: &[(String, Option<String>)],
+        conservative: bool,
+    ) -> Vec<String> {
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let env = ScanEnv {
+            macro_base: base_from(defines),
+            conservative,
+            ..ScanEnv::new(&sp)
+        };
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+        service
+            .scan_tu(
+                &dir.join("main.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |_, _| {},
+            )
+            .unwrap();
+        out.resolved
+            .iter()
+            .map(|d| {
+                service
+                    .path(d.file)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
 
     #[test]
-    fn test_simple_dependency_chain() {
+    fn simple_dependency_chain() {
         let dir = tempfile::tempdir().unwrap();
-
-        // Create a.h -> b.h -> c.h
         fs::write(dir.path().join("c.h"), "// c\n").unwrap();
         fs::write(dir.path().join("b.h"), "#include \"c.h\"\n").unwrap();
         fs::write(dir.path().join("a.c"), "#include \"b.h\"\n").unwrap();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("a.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(deps.len(), 2); // b.h, c.h
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let env = ScanEnv::new(&sp);
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+        service
+            .scan_tu(
+                &dir.path().join("a.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(out.resolved.len(), 2); // b.h, c.h
     }
 
     #[test]
-    fn test_include_guard_prevents_reprocessing() {
+    fn include_guard_prevents_reprocessing() {
         let dir = tempfile::tempdir().unwrap();
-
         fs::write(
             dir.path().join("guarded.h"),
             "#ifndef GUARDED_H\n#define GUARDED_H\n// content\n#endif\n",
@@ -821,29 +617,13 @@ mod tests {
         )
         .unwrap();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let guarded_count = deps
-            .iter()
-            .filter(|d| d.path.file_name().unwrap() == "guarded.h")
-            .count();
-        assert_eq!(guarded_count, 1);
+        let names = scan_names(dir.path(), &[], false);
+        assert_eq!(names.iter().filter(|n| *n == "guarded.h").count(), 1);
     }
 
     #[test]
-    fn test_conditional_ifdef_taken() {
+    fn conditional_ifdef_taken() {
         let dir = tempfile::tempdir().unwrap();
-
         fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
         fs::write(dir.path().join("no.h"), "// no\n").unwrap();
         fs::write(
@@ -852,128 +632,14 @@ mod tests {
         )
         .unwrap();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
+        let names = scan_names(dir.path(), &[], false);
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
     }
 
     #[test]
-    fn test_conditional_if_expr() {
+    fn nested_conditionals() {
         let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
-        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#define USE_YES 1\n#if USE_YES\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"yes.h".to_string()));
-        assert!(!names.contains(&"no.h".to_string()));
-    }
-
-    #[test]
-    fn test_conditional_ifndef() {
-        let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
-        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#ifndef UNDEFINED_MACRO\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"yes.h".to_string()));
-        assert!(!names.contains(&"no.h".to_string()));
-    }
-
-    #[test]
-    fn test_conditional_elif() {
-        let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("a.h"), "// a\n").unwrap();
-        fs::write(dir.path().join("b.h"), "// b\n").unwrap();
-        fs::write(dir.path().join("c.h"), "// c\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#define X 2\n#if X == 1\n#include \"a.h\"\n#elif X == 2\n#include \"b.h\"\n#else\n#include \"c.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(!names.contains(&"a.h".to_string()));
-        assert!(names.contains(&"b.h".to_string()));
-        assert!(!names.contains(&"c.h".to_string()));
-    }
-
-    #[test]
-    fn test_nested_conditionals() {
-        let dir = tempfile::tempdir().unwrap();
-
         fs::write(dir.path().join("inner.h"), "// inner\n").unwrap();
         fs::write(dir.path().join("skip.h"), "// skip\n").unwrap();
         fs::write(
@@ -982,30 +648,27 @@ mod tests {
         )
         .unwrap();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
+        let names = scan_names(dir.path(), &[], false);
         assert!(names.contains(&"inner.h".to_string()));
         assert!(!names.contains(&"skip.h".to_string()));
     }
 
     #[test]
-    fn test_cmdline_defines() {
+    fn computed_include() {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.h"), "// target\n").unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#define HEADER \"target.h\"\n#include HEADER\n",
+        )
+        .unwrap();
+        let names = scan_names(dir.path(), &[], false);
+        assert!(names.contains(&"target.h".to_string()));
+    }
 
+    #[test]
+    fn cmdline_defines_via_base() {
+        let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
         fs::write(dir.path().join("no.h"), "// no\n").unwrap();
         fs::write(
@@ -1014,215 +677,114 @@ mod tests {
         )
         .unwrap();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
         let defines = vec![("FEATURE".to_string(), None)];
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &defines,
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
+        let names = scan_names(dir.path(), &defines, false);
         assert!(names.contains(&"yes.h".to_string()));
         assert!(!names.contains(&"no.h".to_string()));
     }
 
+    // -----------------------------------------------------------------------
+    // The load-bearing invariant: warm content-cache hits still observe.
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_define_in_header_visible_after_include() {
+    fn warm_cache_hit_still_observes_every_tu() {
+        // A shared header included by two TUs. The second TU is a pure content-
+        // cache hit (the header is already minimized), yet it MUST still fire
+        // `observe` for the header, or a virtualizing embedder would drop its
+        // per-TU dependency fact and go stale on an edit.
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("shared.h"), "#pragma once\nint s;\n").unwrap();
+        fs::write(dir.path().join("a.c"), "#include \"shared.h\"\n").unwrap();
+        fs::write(dir.path().join("b.c"), "#include \"shared.h\"\n").unwrap();
 
-        fs::write(dir.path().join("config.h"), "#define HAS_FEATURE 1\n").unwrap();
-        fs::write(dir.path().join("feature.h"), "// feature\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#include \"config.h\"\n#if HAS_FEATURE\n#include \"feature.h\"\n#endif\n",
-        )
-        .unwrap();
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let env = ScanEnv::new(&sp);
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
+        let has_shared =
+            |ids: &[FileId]| ids.iter().any(|&id| service.path(id).ends_with("shared.h"));
 
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"config.h".to_string()));
-        assert!(names.contains(&"feature.h".to_string()));
+        let mut observed_a: Vec<FileId> = Vec::new();
+        service
+            .scan_tu(
+                &dir.path().join("a.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |id, _| observed_a.push(id),
+            )
+            .unwrap();
+        assert!(has_shared(&observed_a));
+
+        // shared.h is now warm in the content cache.
+        let cached_after_first = service.cached_files();
+
+        let mut observed_b: Vec<FileId> = Vec::new();
+        service
+            .scan_tu(
+                &dir.path().join("b.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |id, _| observed_b.push(id),
+            )
+            .unwrap();
+
+        // shared.h was NOT re-minimized, but WAS observed again for this TU.
+        assert!(
+            has_shared(&observed_b),
+            "warm cache hit must still observe the shared header per-TU"
+        );
+        assert_eq!(
+            service.cached_files(),
+            cached_after_first + 1,
+            "only b.c should be newly minimized; shared.h stayed cached"
+        );
     }
 
     #[test]
-    fn test_computed_include() {
+    fn observe_hash_matches_content() {
         let dir = tempfile::tempdir().unwrap();
+        let body = "#pragma once\nint x;\n";
+        fs::write(dir.path().join("h.h"), body).unwrap();
+        fs::write(dir.path().join("m.c"), "#include \"h.h\"\n").unwrap();
 
-        fs::write(dir.path().join("target.h"), "// target\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#define HEADER \"target.h\"\n#include HEADER\n",
-        )
-        .unwrap();
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let env = ScanEnv::new(&sp);
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
 
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
+        let want = crate::intern::content_hash(body.as_bytes());
+        let mut seen: Vec<(FileId, crate::intern::ContentHash)> = Vec::new();
+        service
+            .scan_tu(
+                &dir.path().join("m.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |id, hash| seen.push((id, hash)),
+            )
+            .unwrap();
+        let got = seen
             .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"target.h".to_string()));
-    }
-
-    #[test]
-    fn test_computed_include_chained() {
-        let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("real.h"), "// real\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#define A B\n#define B \"real.h\"\n#include A\n",
-        )
-        .unwrap();
-
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"real.h".to_string()));
-    }
-
-    #[test]
-    fn test_function_like_define_in_if() {
-        let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
-        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#define CHECK(x) x\n#if CHECK(1)\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"yes.h".to_string()));
-        assert!(!names.contains(&"no.h".to_string()));
-    }
-
-    #[test]
-    fn test_has_include_directive() {
-        let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("exists.h"), "// exists\n").unwrap();
-        fs::write(dir.path().join("fallback.h"), "// fallback\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#if __has_include(\"exists.h\")\n#include \"exists.h\"\n#else\n#include \"fallback.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-
-        let deps = collect_deps(
-            &dir.path().join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            &[],
-            &DepCollectOptions::default(),
-        )
-        .unwrap();
-        let names: Vec<_> = deps
-            .iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert!(names.contains(&"exists.h".to_string()));
-        assert!(!names.contains(&"fallback.h".to_string()));
+            .find(|(id, _)| service.path(*id).ends_with("h.h"))
+            .map(|(_, h)| *h);
+        assert_eq!(got, Some(want));
     }
 
     // -----------------------------------------------------------------------
     // Conservative mode
     // -----------------------------------------------------------------------
 
-    /// Scan `main.c` in `dir` and return dependency file names.
-    fn scan_names(
-        dir: &Path,
-        defines: &[(String, Option<String>)],
-        conservative: bool,
-    ) -> Vec<String> {
-        let search_paths = SearchPaths::default();
-        let cache = new_file_cache();
-        let options = DepCollectOptions {
-            conservative,
-            ..Default::default()
-        };
-        let deps = collect_deps(
-            &dir.join("main.c"),
-            &OsVfs,
-            &search_paths,
-            &cache,
-            defines,
-            &options,
-        )
-        .unwrap();
-        deps.iter()
-            .map(|d| d.path.file_name().unwrap().to_string_lossy().to_string())
-            .collect()
-    }
-
     #[test]
-    fn test_conservative_ifdef_predef_takes_both_branches() {
+    fn conservative_predef_takes_both_branches() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
         fs::write(dir.path().join("no.h"), "// no\n").unwrap();
@@ -1238,23 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_conservative_if_defined_predef_takes_both_branches() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("win.h"), "// win\n").unwrap();
-        fs::write(dir.path().join("posix.h"), "// posix\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#if defined(_WIN32)\n#include \"win.h\"\n#else\n#include \"posix.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let names = scan_names(dir.path(), &[], true);
-        assert!(names.contains(&"win.h".to_string()));
-        assert!(names.contains(&"posix.h".to_string()));
-    }
-
-    #[test]
-    fn test_conservative_plain_unknown_macro_takes_else_only() {
+    fn conservative_plain_unknown_macro_takes_else_only() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
         fs::write(dir.path().join("no.h"), "// no\n").unwrap();
@@ -1264,31 +810,14 @@ mod tests {
         )
         .unwrap();
 
-        // FOO is untracked and not predefinable — exact-like behavior.
+        // FOO is untracked and not predefinable, exact-like behavior.
         let names = scan_names(dir.path(), &[], true);
         assert!(!names.contains(&"yes.h".to_string()));
         assert!(names.contains(&"no.h".to_string()));
     }
 
     #[test]
-    fn test_conservative_cmdline_define_single_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
-        fs::write(dir.path().join("no.h"), "// no\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#ifdef FEATURE\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        let defines = vec![("FEATURE".to_string(), None)];
-        let names = scan_names(dir.path(), &defines, true);
-        assert!(names.contains(&"yes.h".to_string()));
-        assert!(!names.contains(&"no.h".to_string()));
-    }
-
-    #[test]
-    fn test_conservative_own_guard_keeps_defines_tracked() {
+    fn conservative_own_guard_keeps_defines_tracked() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("x.h"), "// x\n").unwrap();
         fs::write(dir.path().join("y.h"), "// y\n").unwrap();
@@ -1303,78 +832,127 @@ mod tests {
         )
         .unwrap();
 
-        // g.h's own guard branch is certain, so HAVE_X stays tracked.
         let names = scan_names(dir.path(), &[], true);
         assert!(names.contains(&"x.h".to_string()));
         assert!(!names.contains(&"y.h".to_string()));
     }
 
     #[test]
-    fn test_conservative_uncertain_define_takes_both_branches() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("x.h"), "// x\n").unwrap();
-        fs::write(dir.path().join("y.h"), "// y\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#ifdef __FEATURE__\n#define WITH_X 1\n#endif\n#if WITH_X\n#include \"x.h\"\n#else\n#include \"y.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        // WITH_X is defined only inside a maybe-taken branch, so it becomes
-        // Unknown even though the name is not underscore-prefixed.
-        let names = scan_names(dir.path(), &[], true);
-        assert!(names.contains(&"x.h".to_string()));
-        assert!(names.contains(&"y.h".to_string()));
-    }
-
-    #[test]
-    fn test_conservative_undef_is_known_undefined() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("w.h"), "// w\n").unwrap();
-        fs::write(dir.path().join("u.h"), "// u\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#undef _WIN32\n#ifdef _WIN32\n#include \"w.h\"\n#else\n#include \"u.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        // The tombstone makes _WIN32 known-undefined despite being predefinable.
-        let names = scan_names(dir.path(), &[], true);
-        assert!(!names.contains(&"w.h".to_string()));
-        assert!(names.contains(&"u.h".to_string()));
-    }
-
-    #[test]
-    fn test_conservative_missing_has_include_takes_both_branches() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.h"), "// a\n").unwrap();
-        fs::write(dir.path().join("b.h"), "// b\n").unwrap();
-        fs::write(
-            dir.path().join("main.c"),
-            "#if __has_include(<no/such/header.h>)\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n",
-        )
-        .unwrap();
-
-        // The header may exist in compiler-internal search paths → Unknown.
-        let names = scan_names(dir.path(), &[], true);
-        assert!(names.contains(&"a.h".to_string()));
-        assert!(names.contains(&"b.h".to_string()));
-    }
-
-    #[test]
-    fn test_exact_mode_predef_takes_else_only() {
+    fn conservative_function_like_predef() {
+        // A function-like predef in the base decides an #if in exact-ish form.
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("yes.h"), "// yes\n").unwrap();
         fs::write(dir.path().join("no.h"), "// no\n").unwrap();
         fs::write(
             dir.path().join("main.c"),
-            "#ifdef __linux__\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
+            "#if CHECK(1)\n#include \"yes.h\"\n#else\n#include \"no.h\"\n#endif\n",
         )
         .unwrap();
 
-        // Default (exact) mode: today's semantics, else branch only.
-        let names = scan_names(dir.path(), &[], false);
-        assert!(!names.contains(&"yes.h".to_string()));
-        assert!(names.contains(&"no.h".to_string()));
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let mut base = MacroBase::new();
+        base.define_function_like("CHECK", "(x) x");
+        let env = ScanEnv {
+            macro_base: Arc::new(base),
+            conservative: true,
+            ..ScanEnv::new(&sp)
+        };
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+        service
+            .scan_tu(
+                &dir.path().join("main.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |_, _| {},
+            )
+            .unwrap();
+        let names: Vec<_> = out
+            .resolved
+            .iter()
+            .map(|d| {
+                service
+                    .path(d.file)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(names.contains(&"yes.h".to_string()));
+        assert!(!names.contains(&"no.h".to_string()));
+    }
+
+    #[test]
+    fn missing_include_recorded_when_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.c"),
+            "#include \"gen.h\"\n#include <sys/only.h>\n",
+        )
+        .unwrap();
+
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let env = ScanEnv {
+            missing_as_generated: true,
+            ..ScanEnv::new(&sp)
+        };
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+        service
+            .scan_tu(
+                &dir.path().join("main.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |_, _| {},
+            )
+            .unwrap();
+        assert!(out.missing.iter().any(|m| &**m == "gen.h"));
+        assert!(out.sys_includes.iter().any(|m| &**m == "sys/only.h"));
+    }
+
+    #[test]
+    fn scratch_and_output_reused_across_tus() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("h.h"), "#pragma once\n").unwrap();
+        fs::write(dir.path().join("a.c"), "#include \"h.h\"\n").unwrap();
+        fs::write(dir.path().join("b.c"), "int b;\n").unwrap();
+
+        let service = ScanService::new();
+        let sp = SearchPaths::default();
+        let env = ScanEnv::new(&sp);
+        let mut scratch = ScanScratch::new();
+        let mut out = ScanOutput::new();
+
+        service
+            .scan_tu(
+                &dir.path().join("a.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(out.resolved.len(), 1);
+
+        // Reusing the same scratch + out must fully reset between TUs.
+        service
+            .scan_tu(
+                &dir.path().join("b.c"),
+                &env,
+                &OsVfs,
+                &mut scratch,
+                &mut out,
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(out.resolved.len(), 0);
     }
 }

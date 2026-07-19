@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::depgraph::DepEntry;
+use crate::service::{ResolvedDep, ScanOutput, ScanService};
 
 /// Maximum column before wrapping to a continuation line (matches gcc's mkdeps.cc).
 const MAX_COLUMNS: usize = 72;
@@ -23,65 +23,63 @@ pub struct OutputOptions {
     pub omit_system: bool,
 }
 
-/// Format dependencies in Makefile format, matching `gcc -M` output.
-///
-/// This is the simple API for backward compatibility (equivalent to `-M`).
-pub fn format_makefile_deps(source: &Path, deps: &[DepEntry], target: Option<&str>) -> String {
-    let options = match target {
-        Some(t) => OutputOptions {
-            targets: vec![t.to_string()],
-            ..Default::default()
-        },
-        None => OutputOptions::default(),
-    };
-    format_makefile_deps_with_options(source, deps, &options)
-}
-
-/// Format dependencies in Makefile format with full option support.
-pub fn format_makefile_deps_with_options(
+/// Format a scan result as a `gcc -M`-style Makefile rule. `service` resolves
+/// each [`FileId`](crate::FileId) to a path; a dep's recorded display spelling
+/// (from `..`/`.` includes) wins over its canonical path, as gcc does.
+pub fn format_makefile(
+    service: &ScanService,
     source: &Path,
-    deps: &[DepEntry],
+    out: &ScanOutput,
     options: &OutputOptions,
 ) -> String {
-    let mut out = String::new();
+    let mut result = String::new();
 
-    // Build the target string
-    let target_str = build_target_string(source, options);
-    out.push_str(&target_str);
-    out.push(':');
-    let mut col = target_str.len() + 1;
+    let target = build_target_string(source, options);
+    result.push_str(&target);
+    result.push(':');
+    let mut col = target.len() + 1;
 
-    // Source file first
-    let source_escaped = escape_path(source);
-    wrap_and_push(&mut out, &mut col, &source_escaped);
+    wrap_and_push(&mut result, &mut col, &escape(&source.to_string_lossy()));
 
-    // Then all dependencies (filtering system if -MM)
-    for dep in deps {
-        if options.omit_system && dep.is_system {
-            continue;
-        }
-        let display = dep.display_path.as_deref().unwrap_or(&dep.path);
-        let dep_escaped = escape_path(display);
-        wrap_and_push(&mut out, &mut col, &dep_escaped);
+    let shown = || {
+        out.resolved
+            .iter()
+            .filter(|d| !(options.omit_system && d.is_system))
+    };
+    // Unresolved names are only recorded under `-MG`; gcc lists them verbatim.
+    let unresolved = || out.missing.iter().chain(out.sys_includes.iter());
+
+    for dep in shown() {
+        wrap_and_push(&mut result, &mut col, &dep_spelling(service, dep));
     }
+    for name in unresolved() {
+        wrap_and_push(&mut result, &mut col, &escape(name));
+    }
+    result.push('\n');
 
-    out.push('\n');
-
-    // Phony targets (-MP)
     if options.phony {
-        for dep in deps {
-            if options.omit_system && dep.is_system {
-                continue;
-            }
-            out.push('\n');
-            let display = dep.display_path.as_deref().unwrap_or(&dep.path);
-            let dep_escaped = escape_path(display);
-            out.push_str(&dep_escaped);
-            out.push_str(":\n");
+        for dep in shown() {
+            result.push('\n');
+            result.push_str(&dep_spelling(service, dep));
+            result.push_str(":\n");
+        }
+        for name in unresolved() {
+            result.push('\n');
+            result.push_str(&escape(name));
+            result.push_str(":\n");
         }
     }
 
-    out
+    result
+}
+
+/// The escaped path to print for a dependency: its display spelling if it kept
+/// one, otherwise its canonical path.
+fn dep_spelling(service: &ScanService, dep: &ResolvedDep) -> String {
+    match &dep.display {
+        Some(d) => escape(d),
+        None => escape(&service.path(dep.file).to_string_lossy()),
+    }
 }
 
 /// Build the target string from options or derive from source filename.
@@ -143,9 +141,8 @@ fn wrap_and_push(out: &mut String, col: &mut usize, escaped: &str) {
     *col += escaped.len();
 }
 
-/// Escape a path for Makefile output (escape spaces and special chars).
-fn escape_path(path: &Path) -> String {
-    let s = path.to_string_lossy();
+/// Escape a path spelling for Makefile output (spaces, `#`, `$`).
+fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -170,62 +167,61 @@ fn escape_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::service::{ScanOutput, ScanService};
 
-    fn dep(path: &str) -> DepEntry {
-        DepEntry {
-            path: Arc::from(Path::new(path)),
-            display_path: None,
-            is_system: false,
-            missing_style: None,
+    /// Build a service + output from `(path, is_system)` pairs, in order.
+    fn scan(deps: &[(&str, bool)]) -> (ScanService, ScanOutput) {
+        let service = ScanService::new();
+        let mut out = ScanOutput::new();
+        for (path, is_system) in deps {
+            let id = service.intern(Path::new(path));
+            out.push_resolved(id, *is_system, None);
         }
+        (service, out)
     }
 
-    fn sys_dep(path: &str) -> DepEntry {
-        DepEntry {
-            path: Arc::from(Path::new(path)),
-            display_path: None,
-            is_system: true,
-            missing_style: None,
-        }
+    fn format(source: &str, deps: &[(&str, bool)], options: &OutputOptions) -> String {
+        let (service, out) = scan(deps);
+        format_makefile(&service, Path::new(source), &out, options)
     }
 
     #[test]
     fn test_simple_output() {
-        let source = Path::new("main.c");
-        let deps = vec![dep("foo.h"), dep("bar.h")];
-        let result = format_makefile_deps(source, &deps, None);
+        let result = format(
+            "main.c",
+            &[("foo.h", false), ("bar.h", false)],
+            &OutputOptions::default(),
+        );
         assert_eq!(result, "main.o: main.c foo.h bar.h\n");
     }
 
     #[test]
     fn test_custom_target() {
-        let source = Path::new("src/main.c");
-        let deps = vec![dep("inc/foo.h")];
-        let result = format_makefile_deps(source, &deps, Some("build/main.o"));
+        let options = OutputOptions {
+            targets: vec!["build/main.o".to_string()],
+            ..Default::default()
+        };
+        let result = format("src/main.c", &[("inc/foo.h", false)], &options);
         assert_eq!(result, "build/main.o: src/main.c inc/foo.h\n");
     }
 
     #[test]
     fn test_path_with_spaces() {
-        let source = Path::new("my project/main.c");
-        let deps: Vec<DepEntry> = vec![];
-        let result = format_makefile_deps(source, &deps, None);
+        let result = format("my project/main.c", &[], &OutputOptions::default());
         assert!(result.contains("my\\ project/main.c"));
     }
 
     #[test]
     fn test_line_wrapping() {
-        let source = Path::new("main.c");
-        let deps: Vec<DepEntry> = (0..10)
-            .map(|i| dep(&format!("/very/long/path/to/header{}.h", i)))
+        let deps: Vec<(String, bool)> = (0..10)
+            .map(|i| (format!("/very/long/path/to/header{}.h", i), false))
             .collect();
-        let result = format_makefile_deps(source, &deps, None);
+        let deps: Vec<(&str, bool)> = deps.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let result = format("main.c", &deps, &OutputOptions::default());
         assert!(
             result.contains(" \\\n "),
             "should contain continuation lines"
         );
-        // Verify no line exceeds MAX_COLUMNS (before the backslash)
         for line in result.lines() {
             let content = line.trim_end_matches(" \\");
             assert!(content.len() <= MAX_COLUMNS + 5, "line too long: {}", line);
@@ -234,13 +230,11 @@ mod tests {
 
     #[test]
     fn test_phony_targets() {
-        let source = Path::new("main.c");
-        let deps = vec![dep("foo.h"), dep("bar.h")];
         let options = OutputOptions {
             phony: true,
             ..Default::default()
         };
-        let result = format_makefile_deps_with_options(source, &deps, &options);
+        let result = format("main.c", &[("foo.h", false), ("bar.h", false)], &options);
         assert!(
             result.contains("\nfoo.h:\n"),
             "missing phony target for foo.h"
@@ -253,13 +247,11 @@ mod tests {
 
     #[test]
     fn test_omit_system_headers() {
-        let source = Path::new("main.c");
-        let deps = vec![dep("user.h"), sys_dep("system.h")];
         let options = OutputOptions {
             omit_system: true,
             ..Default::default()
         };
-        let result = format_makefile_deps_with_options(source, &deps, &options);
+        let result = format("main.c", &[("user.h", false), ("system.h", true)], &options);
         assert!(result.contains("user.h"), "should include user header");
         assert!(!result.contains("system.h"), "should omit system header");
     }
@@ -277,39 +269,33 @@ mod tests {
 
     #[test]
     fn test_multiple_targets() {
-        let source = Path::new("main.c");
-        let deps = vec![dep("foo.h")];
         let options = OutputOptions {
             targets: vec!["target1.o".to_string(), "target2.o".to_string()],
             ..Default::default()
         };
-        let result = format_makefile_deps_with_options(source, &deps, &options);
+        let result = format("main.c", &[("foo.h", false)], &options);
         assert!(result.starts_with("target1.o target2.o:"));
     }
 
     #[test]
     fn test_mt_and_mq_combined() {
-        let source = Path::new("main.c");
-        let deps = vec![dep("foo.h")];
         let options = OutputOptions {
             targets: vec!["a.o".to_string()],
             quoted_targets: vec!["$b.o".to_string()],
             ..Default::default()
         };
-        let result = format_makefile_deps_with_options(source, &deps, &options);
+        let result = format("main.c", &[("foo.h", false)], &options);
         assert!(result.starts_with("a.o $$b.o:"));
     }
 
     #[test]
     fn test_phony_with_omit_system() {
-        let source = Path::new("main.c");
-        let deps = vec![dep("user.h"), sys_dep("sys.h")];
         let options = OutputOptions {
             phony: true,
             omit_system: true,
             ..Default::default()
         };
-        let result = format_makefile_deps_with_options(source, &deps, &options);
+        let result = format("main.c", &[("user.h", false), ("sys.h", true)], &options);
         assert!(
             result.contains("\nuser.h:\n"),
             "should have phony for user.h"

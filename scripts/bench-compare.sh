@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Wall-clock comparison: cppscan vs gcc/clang/clang-scan-deps on real C++ source files.
+# Wall-clock comparison: ccdeps vs gcc/clang/clang-scan-deps on real C++ source files.
 #
 # Usage: ./scripts/bench-compare.sh [clang-lib-dir]
 # Default: uses /tmp/clang/clang/lib as the source tree.
 #
-# Requires: gcc, clang, clang-scan-deps, target/release/cppscan
+# Requires: gcc, clang, clang-scan-deps, target/release/ccdeps
 
 set -eu
 
-CPPSCAN="${CPPSCAN:-./target/release/cppscan}"
+CCDEPS="${CCDEPS:-./target/release/ccdeps}"
 CLANG_LIB="${1:-/tmp/clang/clang/lib}"
 CLANG_INC="/tmp/clang/clang/include"
 NPROC=$(nproc)
@@ -18,8 +18,8 @@ if [[ ! -d "$CLANG_LIB" ]]; then
     echo "Error: $CLANG_LIB not found"
     exit 1
 fi
-if [[ ! -x "$CPPSCAN" ]]; then
-    echo "Building cppscan in release mode..."
+if [[ ! -x "$CCDEPS" ]]; then
+    echo "Building ccdeps in release mode..."
     cargo build --release
 fi
 
@@ -117,7 +117,7 @@ if [[ "$HAS_CLANG_SCAN_DEPS" = 1 ]]; then
     rm -f "$SINGLE_COMPDB" /tmp/_single_file.txt
 fi
 
-run_timed "cppscan" "'$CPPSCAN' -M --MG -I '$CLANG_INC' '$SINGLE_FILE'"
+run_timed "ccdeps" "'$CCDEPS' -M --MG -I '$CLANG_INC' '$SINGLE_FILE'"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -155,23 +155,23 @@ if [[ "$HAS_CLANG_SCAN_DEPS" = 1 ]]; then
     rm -f "$FULL_COMPDB"
 fi
 
-# cppscan (single invocation, internally parallel via @file)
+# ccdeps (single invocation, internally parallel via @file)
 RESPONSE_FILE=$(mktemp)
 cp "$FILE_LIST" "$RESPONSE_FILE"
-run_timed "cppscan (all files, parallel)" "'$CPPSCAN' -M --MG -I '$CLANG_INC' '@$RESPONSE_FILE'"
+run_timed "ccdeps (all files, parallel)" "'$CCDEPS' -M --MG -I '$CLANG_INC' '@$RESPONSE_FILE'"
 
 echo ""
 
 # ---------------------------------------------------------------------------
 # Scaling
 # ---------------------------------------------------------------------------
-echo "=== Scaling: cppscan file count ==="
+echo "=== Scaling: ccdeps file count ==="
 echo ""
 for n in 1 10 100 500 "$FILE_COUNT"; do
     n=$((n < FILE_COUNT ? n : FILE_COUNT))
     SUBSET=$(mktemp)
     head -n "$n" "$FILE_LIST" > "$SUBSET"
-    run_timed "cppscan ($n files)" "'$CPPSCAN' -M --MG -I '$CLANG_INC' '@$SUBSET'"
+    run_timed "ccdeps ($n files)" "'$CCDEPS' -M --MG -I '$CLANG_INC' '@$SUBSET'"
     rm -f "$SUBSET"
 done
 

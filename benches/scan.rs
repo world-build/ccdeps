@@ -1,8 +1,17 @@
-use cppscan::minimize;
-use cppscan::{ScanOptions, Scanner};
+use ccdeps::minimize;
+use ccdeps::{ScanOptions, Scanner};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Scan many files over one shared scanner, parallelized by the caller (the
+/// library scans a single TU at a time; batching is the consumer's job).
+fn scan_all(scanner: &Scanner, sources: &[PathBuf]) {
+    sources.par_iter().for_each(|source| {
+        let _ = scanner.scan_file(source);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,7 +41,7 @@ fn has_real_data() -> bool {
 
 fn real_scan_options() -> ScanOptions {
     ScanOptions {
-        search_paths: cppscan::resolve::SearchPaths {
+        search_paths: ccdeps::resolve::SearchPaths {
             include_paths: vec![PathBuf::from(CLANG_INC)],
             ..Default::default()
         },
@@ -129,7 +138,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
     c.bench_function("full_pipeline_20_headers", |b| {
         b.iter(|| {
             let scanner = Scanner::new(ScanOptions {
-                search_paths: cppscan::resolve::SearchPaths {
+                search_paths: ccdeps::resolve::SearchPaths {
                     include_paths: vec![dir.path().to_path_buf()],
                     ..Default::default()
                 },
@@ -168,13 +177,13 @@ fn bench_full_pipeline_parallel(c: &mut Criterion) {
     c.bench_function("parallel_50_files", |b| {
         b.iter(|| {
             let scanner = Scanner::new(ScanOptions {
-                search_paths: cppscan::resolve::SearchPaths {
+                search_paths: ccdeps::resolve::SearchPaths {
                     include_paths: vec![dir.path().to_path_buf()],
                     ..Default::default()
                 },
                 ..Default::default()
             });
-            scanner.scan_files(&sources);
+            scan_all(&scanner, &sources);
         });
     });
 }
@@ -279,7 +288,7 @@ fn bench_scan_parallel_real(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("files", n), &sources, |b, srcs| {
             b.iter(|| {
                 let scanner = Scanner::new(real_scan_options());
-                scanner.scan_files(srcs);
+                scan_all(&scanner, srcs);
             });
         });
     }
@@ -290,7 +299,7 @@ fn bench_scan_parallel_real(c: &mut Criterion) {
     group.bench_with_input(BenchmarkId::new("files", n), &all_sources, |b, srcs| {
         b.iter(|| {
             let scanner = Scanner::new(real_scan_options());
-            scanner.scan_files(srcs);
+            scan_all(&scanner, srcs);
         });
     });
 

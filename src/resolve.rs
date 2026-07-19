@@ -53,7 +53,7 @@ impl SearchPaths {
     ) -> Option<ResolvedInclude> {
         // 1. Current file's directory
         let candidate = including_file_dir.join(path);
-        if vfs.is_file(&candidate) {
+        if vfs.is_regular_file(&candidate) {
             let display = make_display_path_with_dir(
                 display_dir.unwrap_or(including_file_dir),
                 including_file_dir,
@@ -69,7 +69,7 @@ impl SearchPaths {
         // 2. -iquote paths
         for dir in &self.quote_paths {
             let candidate = dir.join(path);
-            if vfs.is_file(&candidate) {
+            if vfs.is_regular_file(&candidate) {
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
                     path: candidate,
@@ -91,7 +91,7 @@ impl SearchPaths {
     pub fn resolve_angle(&self, path: &str, vfs: &dyn Vfs) -> Option<ResolvedInclude> {
         for dir in &self.include_paths {
             let candidate = dir.join(path);
-            if vfs.is_file(&candidate) {
+            if vfs.is_regular_file(&candidate) {
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
                     path: candidate,
@@ -103,7 +103,7 @@ impl SearchPaths {
 
         for dir in &self.system_paths {
             let candidate = dir.join(path);
-            if vfs.is_file(&candidate) {
+            if vfs.is_regular_file(&candidate) {
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
                     path: candidate,
@@ -141,7 +141,7 @@ impl SearchPaths {
                 continue;
             }
             let candidate = dir.join(path);
-            if vfs.is_file(&candidate) {
+            if vfs.is_regular_file(&candidate) {
                 let is_system = self.system_paths.iter().any(|sp| sp == dir);
                 let display = make_display_path(dir, path);
                 return Some(ResolvedInclude {
