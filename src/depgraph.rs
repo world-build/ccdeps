@@ -451,11 +451,14 @@ fn process_resolved(
     };
 
     // Mark visited before observing/recording so re-encounters this TU dedup.
+    // The visited-set is what enforces `#pragma once` and include guards: a file
+    // is walked once per TU, and a guard that is already defined makes the walk
+    // skip the body through the `#ifndef` itself.
     visited.mark(file);
     observe(file, info.content_hash);
     out.push_resolved(file, is_system, display);
 
-    if !recurse || info.is_dominated(macros) {
+    if !recurse {
         return;
     }
 
@@ -619,6 +622,23 @@ mod tests {
 
         let names = scan_names(dir.path(), &[], false);
         assert_eq!(names.iter().filter(|n| *n == "guarded.h").count(), 1);
+    }
+
+    #[test]
+    fn pragma_once_file_still_recurses_into_its_includes() {
+        // `#pragma once` means "process once per TU", not "never process". A
+        // pragma-once header on first encounter must still follow its includes.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("c.h"), "#pragma once\nint c;\n").unwrap();
+        fs::write(dir.path().join("b.h"), "#pragma once\n#include \"c.h\"\n").unwrap();
+        fs::write(dir.path().join("main.c"), "#include \"b.h\"\n").unwrap();
+
+        let names = scan_names(dir.path(), &[], false);
+        assert!(names.contains(&"b.h".to_string()));
+        assert!(
+            names.contains(&"c.h".to_string()),
+            "pragma-once b.h must still pull in c.h: {names:?}"
+        );
     }
 
     #[test]

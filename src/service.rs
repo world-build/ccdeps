@@ -50,19 +50,6 @@ pub struct FileInfo {
     pub original_size: usize,
 }
 
-impl FileInfo {
-    /// Whether including this file again contributes nothing new because it is
-    /// `#pragma once` or its include guard is already defined.
-    pub(crate) fn is_dominated(&self, macros: &MacroTable) -> bool {
-        self.has_pragma_once
-            || (self.has_include_guard
-                && self
-                    .guard_macro
-                    .as_deref()
-                    .is_some_and(|g| macros.is_defined(g)))
-    }
-}
-
 /// Process-wide options for a [`ScanService`]. These affect *content*
 /// (minimization), so they belong to the service and its content cache rather
 /// than to a per-TU [`ScanEnv`].
