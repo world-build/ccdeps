@@ -5,8 +5,8 @@
       "kind": "git",
       "url": "ssh://git@github.com/world-build/community.world.git",
       "branch": "main",
-      "rev": "8fd5b8856c9b1cd48cb12f5181bf9d15802ec49b",
-      "hash": "sha256-Vby4AFjiVvHomsJ9/t0UIigRtTKja1pi9Au/ErnhzB0="
+      "rev": "7553b7654f0772e0bdce19a555869369af8cb3ed",
+      "hash": "sha256-WkQ3/rZ0uggB5LNAZjGy0YVUvVHGUdYelAvqmzKE+Yk="
     },
     "nixpkgs": {
       "kind": "github",
