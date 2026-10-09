@@ -11,6 +11,8 @@ edition = "2021"
 description = "High-performance C preprocessor dependency scanner"
 license = "MIT"
 repository = "https://github.com/world-build/ccdeps"
+keywords = ["c", "cpp", "preprocessor", "dependencies", "build"]
+categories = ["development-tools::build-utils", "compilers"]
 
 [lib]
 name = "ccdeps"

@@ -27,7 +27,7 @@ for file in out.includes() {
 }
 ```
 
-The `ccdeps` CLI wraps the engine and used is for benchmarking and for
+The `ccdeps` CLI wraps the engine and is used for benchmarking and for
 conformance testing against the real compilers.
 
 ```sh
